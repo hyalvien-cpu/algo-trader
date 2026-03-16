@@ -2035,6 +2035,27 @@ def api_reset_baseline():
     save(data)
     return jsonify({"ok":True,"base_nav":round(total,2)})
 
+@app.route("/api/alpaca_auto_capital",methods=["POST"])
+def api_alpaca_auto_capital():
+    """从 Alpaca 账户读取 equity 自动设置为本地资金量"""
+    if not alpaca_enabled:
+        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
+    acct = alpaca_get_account()
+    if "error" in (acct or {}):
+        return jsonify({"ok":False,"msg":acct.get("error","获取账户失败")})
+    equity = float(acct.get("equity", 0))
+    if equity < 1000:
+        return jsonify({"ok":False,"msg":f"Alpaca 账户余额过低 ${equity:,.2f}"})
+    data = load()
+    CONFIG["INITIAL_CASH"] = equity
+    data["initial_cash"] = equity
+    data["base_nav"] = equity
+    local_mkt = sum(p["shares"]*data.get("prices",{}).get(t,p["avg_cost"])
+                     for t,p in data["positions"].items() if p.get("source","local")=="local")
+    data["cash"] = equity - local_mkt
+    save(data)
+    return jsonify({"ok":True,"equity":round(equity,2),"cash":round(data["cash"],2)})
+
 @app.route("/api/set_capital",methods=["POST"])
 def api_set_capital():
     body=request.get_json(force=True) or {}
@@ -2832,7 +2853,34 @@ async function syncAlpaca(){
   await load();loadAlpacaStatus();
 }
 
+async function checkAlpacaCapital(){
+  try{
+    const r=await fetch('/api/alpaca_status');const d=await r.json();
+    if(!d.enabled)return;
+    const eq=parseFloat(d.account?.equity||0);
+    if(eq<1000)return;
+    const cur=portfolio.config?.initial||100000;
+    // 资金差异超过5%才提示
+    if(Math.abs(eq-cur)/cur<0.05)return;
+    const yes=confirm(
+      'Alpaca 模拟盘资金: $'+eq.toLocaleString('en-US',{minimumFractionDigits:2})+
+      '\n当前本地资金: $'+cur.toLocaleString('en-US',{minimumFractionDigits:2})+
+      '\n\n是否同步 Alpaca 资金量？\n\n点击「确定」自动同步\n点击「取消」手动设置');
+    if(yes){
+      await fetch('/api/alpaca_auto_capital',{method:'POST'});
+      await load();
+    }else{
+      // 跳转资金设置页
+      document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
+      document.getElementById('page-settings').classList.add('active');
+      document.querySelectorAll('.nav-item').forEach(x=>{if(x.textContent.includes('资金设置'))x.classList.add('active');});
+    }
+  }catch(e){}
+}
+
 load();loadSummaries();pollModelStatus();loadLiveNews();loadAlpacaStatus();loadSchedule();
+setTimeout(checkAlpacaCapital,2000);
 setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);setInterval(loadAlpacaStatus,60000);setInterval(loadSchedule,60000);
 </script></body></html>"""
 
@@ -2958,11 +3006,43 @@ def start_scheduler():
     except ImportError:
         print("[提示] pip install apscheduler 开启定时自动交易")
 
+def _auto_init_capital():
+    """启动时自动从 Alpaca 读取资金量设置"""
+    if not alpaca_enabled:
+        return
+    data = load()
+    # 已手动设置过资金则跳过
+    if data.get("_alpaca_capital_synced"):
+        return
+    try:
+        acct = alpaca_get_account()
+        equity = float(acct.get("equity", 0))
+        if equity >= 1000:
+            CONFIG["INITIAL_CASH"] = equity
+            data["initial_cash"] = equity
+            data["base_nav"] = equity
+            data["cash"] = equity
+            data["_alpaca_capital_synced"] = True
+            save(data)
+            print(f"[启动] 自动从 Alpaca 同步资金量: ${equity:,.2f}")
+    except Exception as e:
+        print(f"[启动] Alpaca 资金同步失败: {e}")
+
+def _auto_first_scan():
+    """若无交易记录，自动触发首次扫描"""
+    data = load()
+    if not data.get("trades"):
+        print("[启动] 无交易记录，自动触发首次扫描...")
+        threading.Thread(target=run_cycle_bg, daemon=True).start()
+
 def _on_startup():
     """统一启动后台服务（兼容 gunicorn 和直接运行）"""
     _ensure_finbert()
+    _auto_init_capital()
     start_scheduler()
     start_news_crawler()
+    # 延迟5秒后检查是否需要首次扫描（等 FinBERT 加载）
+    threading.Timer(5, _auto_first_scan).start()
 
 # gunicorn / waitress 等 WSGI 服务器会直接 import app，需要在模块加载时启动后台
 _startup_done = False
