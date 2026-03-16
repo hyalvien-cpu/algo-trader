@@ -274,10 +274,15 @@ CONFIG["MACRO_WEIGHT"] = 0.35
 
 def load():
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text("utf-8"))
+        d = json.loads(DATA_FILE.read_text("utf-8"))
+        # 恢复用户设置的资金量
+        if "initial_cash" in d:
+            CONFIG["INITIAL_CASH"] = d["initial_cash"]
+        return d
     d = {"cash": CONFIG["INITIAL_CASH"], "positions": {}, "trades": [],
          "daily_nav": [], "prices": {}, "sector_scores": {},
          "base_nav": CONFIG["INITIAL_CASH"],
+         "initial_cash": CONFIG["INITIAL_CASH"],
          "created": datetime.now().strftime("%Y-%m-%d")}
     save(d); return d
 
@@ -1464,14 +1469,21 @@ def sim_buy(data, ticker, price, usd, analysis):
         try:
             acct = alpaca_get_account()
             bp = float(acct.get("buying_power", 0))
-            if bp < usd:
-                print(f"[Alpaca] Alpaca 可用资金不足（${bp:,.2f} < ${usd:,.2f}），仅本地模拟")
+            if bp < 1000:
+                print(f"[Alpaca] Alpaca资金不足（${bp:,.2f}），跳过")
             else:
-                order = alpaca_place_order(ticker, "buy", usd)
+                alpaca_usd = usd
+                if bp < usd:
+                    alpaca_usd = bp * 0.95
+                    print(f"[Alpaca] 可用${bp:,.2f} < 目标${usd:,.2f}，调整为${alpaca_usd:,.2f}")
+                order = alpaca_place_order(ticker, "buy", alpaca_usd)
                 if "id" in order:
                     data["positions"][ticker]["alpaca_order_id"] = order["id"]
-        except Exception:
-            pass
+                    print(f"[Alpaca] {ticker} 下单成功 order_id={order['id']}")
+                elif "error" in order:
+                    print(f"[Alpaca] {ticker} 下单失败: {order['error']}")
+        except Exception as e:
+            print(f"[Alpaca] {ticker} 下单异常: {e}")
     return True,f"买入 {ticker} {shares:.4f}股 @ ${price:.2f} 仓位${usd:,.0f}"
 
 def sim_sell(data, ticker, price, reason="SELL"):
@@ -1489,9 +1501,11 @@ def sim_sell(data, ticker, price, reason="SELL"):
     # Alpaca 模拟盘同步清仓
     if alpaca_enabled:
         try:
-            alpaca_close_position(ticker)
-        except Exception:
-            pass
+            result = alpaca_close_position(ticker)
+            if "error" in (result or {}):
+                print(f"[Alpaca] {ticker} 平仓失败: {result['error']}，继续更新本地记录")
+        except Exception as e:
+            print(f"[Alpaca] {ticker} 平仓异常: {e}，继续更新本地记录")
     del data["positions"][ticker]
     return True,f"卖出 {ticker} 盈亏${pnl:+.2f}({pnl_pct:+.1f}%) 持{hold_days}天"
 
@@ -1502,6 +1516,67 @@ def sim_sell(data, ticker, price, reason="SELL"):
 scan_status={"running":False,"log":[],"progress":0,"total":0,
              "phase":"","sector_scores":{},"analyses":[]}
 
+def alpaca_sync_positions():
+    """同步 Alpaca 持仓到本地（扫描前调用）"""
+    if not alpaca_enabled:
+        return
+    try:
+        data = load()
+        ap = alpaca_get_positions()
+        if isinstance(ap, dict) and "error" in ap:
+            print(f"[Alpaca同步] 获取持仓失败: {ap['error']}")
+            return
+        alpaca_tickers = set()
+        for pos in ap:
+            ticker = pos.get("symbol", "")
+            if not ticker:
+                continue
+            alpaca_tickers.add(ticker)
+            price = float(pos.get("current_price", 0))
+            shares = float(pos.get("qty", 0))
+            avg_cost = float(pos.get("avg_entry_price", 0))
+            if ticker in data["positions"]:
+                data["positions"][ticker]["shares"] = shares
+                data["positions"][ticker]["avg_cost"] = avg_cost
+            else:
+                data["positions"][ticker] = {
+                    "shares": shares, "avg_cost": avg_cost,
+                    "buy_date": datetime.now().strftime("%Y-%m-%d"),
+                    "target_sell_date": (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
+                    "hold_reason": "Alpaca同步", "buy_score": 0, "sector": "",
+                    "peak_price": price, "trailing_drawdown": 0.0,
+                    "confidence_score": 0, "confidence_level": "",
+                    "source": "alpaca",
+                }
+                print(f"[Alpaca同步] 新增持仓 {ticker} {shares}股 @ ${avg_cost:.2f}")
+            data["prices"][ticker] = price
+        # 本地有但 Alpaca 没有 → 已被平仓
+        for t in list(data["positions"].keys()):
+            if t not in alpaca_tickers and data["positions"][t].get("source") == "alpaca":
+                price = data["prices"].get(t, data["positions"][t]["avg_cost"])
+                print(f"[Alpaca同步] {t} 已在Alpaca平仓，同步移除")
+                del data["positions"][t]
+        save(data)
+    except Exception as e:
+        print(f"[Alpaca同步] 出错: {e}")
+
+def run_premarket_analysis():
+    """盘前准备：只爬新闻分析宏观，不下单"""
+    print(f"[盘前准备 {datetime.now():%H:%M:%S}] 开始盘前新闻分析...")
+    try:
+        news = fetch_all_news()
+        macro_news = fetch_macro_news()
+        data = load()
+        sector_scores = analyze_sector_sentiment(news)
+        data["sector_scores"] = sector_scores
+        macro_adj = analyze_macro_events(macro_news)
+        data["macro_adj"] = macro_adj
+        save(data)
+        bias_text = "利空" if macro_adj["market_bias"] < 0 else "利好" if macro_adj["market_bias"] > 0 else "中性"
+        print(f"[盘前准备] 完成 | {len(news)}条新闻 | 宏观{bias_text} | {macro_adj['summary']}")
+    except Exception as e:
+        print(f"[盘前准备] 出错: {e}")
+
 def run_cycle_bg():
     global scan_status
     scan_status={"running":True,"log":[],"progress":0,"total":0,
@@ -1511,7 +1586,17 @@ def run_cycle_bg():
         scan_status["log"].append({"msg":msg,"type":t,"time":datetime.now().strftime("%H:%M:%S")})
         print(f"[{datetime.now():%H:%M:%S}] {msg}")
 
+    # Alpaca 持仓同步
+    if alpaca_enabled:
+        log("🔄 同步 Alpaca 持仓...","info")
+        alpaca_sync_positions()
+
     data=load()
+
+    # 自动交易开关检查
+    auto_enabled = data.get("auto_trade_enabled", True)
+    if not auto_enabled:
+        log("⏸️ 自动交易已暂停，仅分析模式","warning")
 
     # Phase 1: 新闻 & 板块分析
     log("📰 爬取财经新闻...")
@@ -1689,9 +1774,12 @@ def run_cycle_bg():
 
     # Phase 4: 买入
     scan_status["phase"]="执行交易"
+    if not auto_enabled:
+        log("⏸️ 仅分析模式，跳过买入操作","warning")
     candidates=sorted(candidates,key=lambda x:-x["score"])
     total=portfolio_value(data,data["prices"])
     for a in candidates:
+        if not auto_enabled: break
         if len(data["positions"])>=CONFIG["MAX_POSITIONS"]: break
         price=a.get("price") or get_prices([a["ticker"]]).get(a["ticker"])
         if not price: continue
@@ -1878,6 +1966,50 @@ def api_alpaca_sync():
     save(data)
     return jsonify({"ok":True,"synced":synced,"count":len(synced)})
 
+@app.route("/api/auto_trade_toggle",methods=["POST"])
+def api_auto_trade_toggle():
+    body=request.get_json(force=True) or {}
+    enabled=body.get("enabled",True)
+    data=load()
+    data["auto_trade_enabled"]=bool(enabled)
+    save(data)
+    return jsonify({"ok":True,"auto_trade_enabled":data["auto_trade_enabled"]})
+
+@app.route("/api/market_schedule")
+def api_market_schedule():
+    from datetime import timezone
+    try:
+        import zoneinfo
+        et=datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+    except Exception:
+        et=datetime.utcnow()-timedelta(hours=5)
+    weekday=et.weekday()  # 0=Mon
+    is_market_day=weekday<5
+    hour,minute=et.hour,et.minute
+    market_open=is_market_day and 9<=hour<16 and (hour>9 or minute>=30)
+    # 下次扫描时间
+    scan_times=[(9,25,"09:25 盘前准备"),(9,31,"09:31 开盘扫描"),(11,0,"11:00"),(14,0,"14:00"),(15,30,"15:30")]
+    next_scan="明日 09:25 ET"
+    now_min=hour*60+minute
+    if is_market_day:
+        for h,m,label in scan_times:
+            if now_min<h*60+m:
+                next_scan=f"{label} ET"
+                break
+    # 今日交易数
+    data=load()
+    today=et.strftime("%Y-%m-%d")
+    today_trades=len([t for t in data.get("trades",[]) if t["time"].startswith(today)])
+    return jsonify({
+        "is_market_day":is_market_day,
+        "market_open":market_open,
+        "next_scan":next_scan,
+        "et_time":et.strftime("%H:%M:%S ET"),
+        "et_weekday":["周一","周二","周三","周四","周五","周六","周日"][weekday],
+        "today_trades":today_trades,
+        "auto_enabled":data.get("auto_trade_enabled",True),
+    })
+
 @app.route("/api/reset_baseline",methods=["POST"])
 def api_reset_baseline():
     data=load()
@@ -1901,8 +2033,9 @@ def api_set_capital():
     pos_value=sum(p["shares"]*prices.get(t,p["avg_cost"]) for t,p in data["positions"].items())
     if new_capital<pos_value:
         return jsonify({"ok":False,"msg":f"新资金量不能低于当前持仓市值 ${pos_value:,.0f}"})
-    # 更新 CONFIG 和 data
+    # 更新 CONFIG 和 data（持久化到文件）
     CONFIG["INITIAL_CASH"]=new_capital
+    data["initial_cash"]=new_capital
     data["cash"]=new_capital-pos_value
     # 重算 daily_nav 最新一条
     nav_list=data.get("daily_nav",[])
@@ -2046,7 +2179,18 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <span id="alpaca-equity" style="font-size:12px;font-family:var(--mono);color:var(--muted)">—</span>
     <span id="alpaca-cash" style="font-size:12px;color:var(--muted)">现金 —</span>
     <span id="alpaca-market" style="font-size:11px;padding:2px 8px;border-radius:4px;background:var(--card);color:var(--muted)">市场 —</span>
+    <span id="auto-trade-badge" style="font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer" onclick="toggleAutoTrade()">—</span>
     <button onclick="syncAlpaca()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步持仓</button>
+  </div>
+  <div id="schedule-card" style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:6px">
+      <span id="sch-market-dot" style="font-size:10px">⚫</span>
+      <span id="sch-market-text" style="font-size:12px;font-weight:500;color:var(--muted)">—</span>
+    </div>
+    <span id="sch-et" style="font-size:11px;font-family:var(--mono);color:var(--muted)">—</span>
+    <span id="sch-next" style="font-size:11px;color:var(--accent)">—</span>
+    <span id="sch-trades" style="font-size:11px;color:var(--muted)">—</span>
+    <span id="sch-auto" style="font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer" onclick="toggleAutoTrade()">—</span>
   </div>
   <div class="chart-card"><div class="stitle">净值曲线</div><div class="cwrap"><canvas id="nav-chart"></canvas></div></div>
   <div class="box" style="margin-bottom:18px"><div class="stitle">🏛️ 宏观政策事件</div><div id="macro-mini"><div class="empty">扫描后可见</div></div></div>
@@ -2620,6 +2764,35 @@ async function resetAccount(){
   document.getElementById('set-msg').textContent='账户已重置';
 }
 
+async function loadSchedule(){
+  try{
+    const r=await fetch('/api/market_schedule');const d=await r.json();
+    const dot=d.market_open?'🟢':d.is_market_day?'🟡':'⚫';
+    const txt=d.market_open?'开市中':d.is_market_day?'休市':'休市（'+d.et_weekday+'）';
+    document.getElementById('sch-market-dot').textContent=dot;
+    document.getElementById('sch-market-text').textContent=txt;
+    document.getElementById('sch-market-text').style.color=d.market_open?'var(--green)':'var(--muted)';
+    document.getElementById('sch-et').textContent=d.et_time;
+    document.getElementById('sch-next').textContent='下次: '+d.next_scan;
+    document.getElementById('sch-trades').textContent='今日 '+d.today_trades+' 笔交易';
+    const autoEl=document.getElementById('sch-auto');
+    autoEl.textContent=d.auto_enabled?'自动交易 开启':'仅分析模式';
+    autoEl.style.background=d.auto_enabled?'rgba(30,204,110,0.12)':'rgba(90,90,120,0.12)';
+    autoEl.style.color=d.auto_enabled?'var(--green)':'var(--muted)';
+    // 同步 alpaca bar 上的 badge
+    const ab=document.getElementById('auto-trade-badge');
+    if(ab){ab.textContent=autoEl.textContent;ab.style.background=autoEl.style.background;ab.style.color=autoEl.style.color;}
+  }catch(e){}
+}
+async function toggleAutoTrade(){
+  try{
+    const r=await fetch('/api/market_schedule');const cur=await r.json();
+    const newVal=!cur.auto_enabled;
+    if(!newVal&&!confirm('暂停自动交易后，系统只分析不下单。确认？')) return;
+    await fetch('/api/auto_trade_toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:newVal})});
+    loadSchedule();
+  }catch(e){}
+}
 async function loadAlpacaStatus(){
   try{
     const r=await fetch('/api/alpaca_status');const d=await r.json();
@@ -2638,8 +2811,8 @@ async function syncAlpaca(){
   await load();loadAlpacaStatus();
 }
 
-load();loadSummaries();pollModelStatus();loadLiveNews();loadAlpacaStatus();
-setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);setInterval(loadAlpacaStatus,60000);
+load();loadSummaries();pollModelStatus();loadLiveNews();loadAlpacaStatus();loadSchedule();
+setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);setInterval(loadAlpacaStatus,60000);setInterval(loadSchedule,60000);
 </script></body></html>"""
 
 # ══════════════════════════════════════════════════════
@@ -2751,10 +2924,16 @@ def start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         s=BackgroundScheduler(timezone="America/New_York")
-        for h in CONFIG["TRADE_HOURS"]:
-            s.add_job(run_cycle_bg,"cron",hour=h,minute=0,day_of_week="mon-fri")
+        # 盘前准备：09:25 只分析不下单
+        s.add_job(run_premarket_analysis,"cron",hour=9,minute=25,day_of_week="mon-fri",id="premarket")
+        # 开盘后立即扫描（信号最强）
+        s.add_job(run_cycle_bg,"cron",hour=9,minute=31,day_of_week="mon-fri",id="scan_0931")
+        # 盘中扫描
+        s.add_job(run_cycle_bg,"cron",hour=11,minute=0,day_of_week="mon-fri",id="scan_1100")
+        s.add_job(run_cycle_bg,"cron",hour=14,minute=0,day_of_week="mon-fri",id="scan_1400")
+        s.add_job(run_cycle_bg,"cron",hour=15,minute=30,day_of_week="mon-fri",id="scan_1530")
         s.start()
-        print(f"[定时] 工作日美东 {CONFIG['TRADE_HOURS']} 点自动运行")
+        print("[定时] 工作日美东 09:25盘前 | 09:31/11:00/14:00/15:30 自动扫描")
     except ImportError:
         print("[提示] pip install apscheduler 开启定时自动交易")
 
