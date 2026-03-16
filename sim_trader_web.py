@@ -1750,6 +1750,30 @@ def api_backtest():
     result = run_backtest(tickers, period_days=period)
     return jsonify(result)
 
+@app.route("/api/set_capital",methods=["POST"])
+def api_set_capital():
+    body=request.get_json(force=True) or {}
+    new_capital=body.get("capital")
+    if not new_capital or not isinstance(new_capital,(int,float)) or new_capital<1000:
+        return jsonify({"ok":False,"msg":"资金量必须 >= $1,000"})
+    new_capital=float(new_capital)
+    data=load()
+    old_init=CONFIG["INITIAL_CASH"]
+    # 计算当前持仓市值
+    prices=data.get("prices",{})
+    pos_value=sum(p["shares"]*prices.get(t,p["avg_cost"]) for t,p in data["positions"].items())
+    if new_capital<pos_value:
+        return jsonify({"ok":False,"msg":f"新资金量不能低于当前持仓市值 ${pos_value:,.0f}"})
+    # 更新 CONFIG 和 data
+    CONFIG["INITIAL_CASH"]=new_capital
+    data["cash"]=new_capital-pos_value
+    # 重算 daily_nav 最新一条
+    nav_list=data.get("daily_nav",[])
+    if nav_list:
+        nav_list[-1]["nav"]=new_capital
+    save(data)
+    return jsonify({"ok":True,"capital":new_capital,"cash":round(data["cash"],2)})
+
 @app.route("/api/reset",methods=["POST"])
 def api_reset():
     if DATA_FILE.exists(): DATA_FILE.unlink()
@@ -1793,6 +1817,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:1
 .pbar-fill{height:100%;background:var(--accent);transition:width 0.3s}
 .phase{font-size:10px;color:var(--accent);text-align:center;margin-bottom:6px;min-height:13px}
 .last{font-size:10px;color:var(--muted);text-align:center;margin-top:7px}
+.cap-preset{padding:6px 14px;background:var(--card);color:var(--muted);border:1px solid var(--border);border-radius:5px;font-family:var(--mono);font-size:11px;cursor:pointer;transition:all .15s}
+.cap-preset:hover{color:var(--text);border-color:var(--accent);background:rgba(124,110,255,0.08)}
 .main{overflow-y:auto;padding:24px 26px}
 .page{display:none}.page.active{display:block}
 .ptitle{font-size:19px;font-weight:800;margin-bottom:20px;letter-spacing:-0.4px}
@@ -1851,6 +1877,7 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <div class="nav-item" onclick="nav('trades',this)">◇ &nbsp;交易记录</div>
     <div class="nav-item" onclick="nav('livenews',this)">◈ &nbsp;实时新闻</div>
     <div class="nav-item" onclick="nav('backtest',this)">◆ &nbsp;回测系统</div>
+    <div class="nav-item" onclick="nav('settings',this)">⚙ &nbsp;资金设置</div>
   </div>
   <div class="sidebar-foot">
     <div class="phase" id="phase"></div>
@@ -1985,6 +2012,47 @@ tr:hover td{background:rgba(124,110,255,0.03)}
   </div>
 </div>
 
+<div class="page" id="page-settings">
+  <div class="ptitle">资金设置</div>
+  <div class="box" style="max-width:480px">
+    <div class="stitle">调整总资金量</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:16px;line-height:1.7">
+      修改初始资金后，系统会自动重新计算可用现金（总资金 − 当前持仓市值）。<br>
+      已有持仓不受影响，盈亏将基于新资金量重新计算。
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <label style="font-size:11px;color:var(--muted);min-width:70px">当前资金</label>
+      <span id="set-cur" style="font-size:16px;font-weight:700;font-family:var(--mono);color:var(--text)">—</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <label style="font-size:11px;color:var(--muted);min-width:70px">新资金量</label>
+      <input id="set-input" type="number" min="1000" step="1000" placeholder="例如 200000"
+        style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-family:var(--mono);font-size:13px;outline:none">
+      <span style="font-size:12px;color:var(--muted)">USD</span>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button onclick="setCapitalPreset(50000)" class="cap-preset">$50K</button>
+      <button onclick="setCapitalPreset(100000)" class="cap-preset">$100K</button>
+      <button onclick="setCapitalPreset(200000)" class="cap-preset">$200K</button>
+      <button onclick="setCapitalPreset(500000)" class="cap-preset">$500K</button>
+      <button onclick="setCapitalPreset(1000000)" class="cap-preset">$1M</button>
+    </div>
+    <button onclick="applyCapital()" id="set-btn"
+      style="margin-top:20px;width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-family:var(--sans);font-size:13px;font-weight:700;cursor:pointer">
+      确认修改
+    </button>
+    <div id="set-msg" style="margin-top:10px;font-size:11px;text-align:center"></div>
+  </div>
+  <div class="box" style="max-width:480px;margin-top:16px">
+    <div class="stitle">重置账户</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:12px">清空所有持仓、交易记录，以当前资金量重新开始。此操作不可撤销。</div>
+    <button onclick="resetAccount()"
+      style="padding:8px 20px;background:transparent;color:var(--red);border:1px solid var(--red);border-radius:6px;font-family:var(--sans);font-size:12px;font-weight:600;cursor:pointer">
+      重置账户
+    </button>
+  </div>
+</div>
+
 </div></div>
 <script>
 let navChart=null,portfolio={};
@@ -2000,7 +2068,7 @@ const pct=n=>n==null?'—':(n>=0?'+':'')+Number(n).toFixed(2)+'%';
 const cc=n=>n>0?'green':n<0?'red':'';
 async function load(){
   const r=await fetch('/api/portfolio');portfolio=await r.json();
-  renderDash();renderSectors();renderPositions();renderTrades();
+  renderDash();renderSectors();renderPositions();renderTrades();updateSettingsPage();
 }
 function renderDash(){
   const p=portfolio;
@@ -2369,6 +2437,34 @@ async function loadLiveNews(){
         <span style="width:32px;text-align:right;font-size:10px;color:${s.score>0?'var(--green)':s.score<0?'var(--red)':'var(--muted)'}">${s.label||'—'}</span>
       </div>`;}).join(''):'<div class="empty">等待首轮爬取...</div>';
   }catch(e){console.error('loadLiveNews',e);}
+}
+
+function setCapitalPreset(v){document.getElementById('set-input').value=v;}
+function updateSettingsPage(){
+  const init=portfolio.config?.initial||100000;
+  document.getElementById('set-cur').textContent='$'+init.toLocaleString();
+  document.getElementById('set-input').placeholder='当前 '+init.toLocaleString();
+}
+async function applyCapital(){
+  const v=parseFloat(document.getElementById('set-input').value);
+  const msg=document.getElementById('set-msg');
+  if(!v||v<1000){msg.style.color='var(--red)';msg.textContent='请输入 >= $1,000 的金额';return;}
+  if(!confirm('确认将总资金修改为 $'+v.toLocaleString()+' ?')) return;
+  const btn=document.getElementById('set-btn');btn.disabled=true;btn.textContent='处理中...';
+  try{
+    const r=await fetch('/api/set_capital',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({capital:v})});
+    const d=await r.json();
+    if(d.ok){msg.style.color='var(--green)';msg.textContent='修改成功！新资金量 $'+d.capital.toLocaleString();
+      document.getElementById('set-input').value='';load();}
+    else{msg.style.color='var(--red)';msg.textContent=d.msg||'修改失败';}
+  }catch(e){msg.style.color='var(--red)';msg.textContent='请求失败';}
+  btn.disabled=false;btn.textContent='确认修改';
+}
+async function resetAccount(){
+  if(!confirm('确认重置？所有持仓和交易记录将被清空，此操作不可撤销！')) return;
+  await fetch('/api/reset',{method:'POST'});load();
+  document.getElementById('set-msg').style.color='var(--green)';
+  document.getElementById('set-msg').textContent='账户已重置';
 }
 
 load();loadSummaries();pollModelStatus();loadLiveNews();
