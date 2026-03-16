@@ -1626,9 +1626,22 @@ def run_cycle_bg():
         scan_status["log"].append({"msg":msg,"type":t,"time":datetime.now().strftime("%H:%M:%S")})
         print(f"[{datetime.now():%H:%M:%S}] {msg}")
 
-    # Alpaca 持仓同步
+    # Alpaca 资金 & 持仓同步
     if alpaca_enabled:
-        log("🔄 同步 Alpaca 持仓...","info")
+        log("🔄 同步 Alpaca 资金与持仓...","info")
+        try:
+            acct = alpaca_get_account()
+            eq = float(acct.get("equity", 0))
+            ac = float(acct.get("cash", 0))
+            if eq >= 1000:
+                _d = load()
+                CONFIG["INITIAL_CASH"] = eq
+                _d["initial_cash"] = eq
+                _d["cash"] = ac
+                save(_d)
+                log(f"💰 已同步 Alpaca 资金: 总资产 ${eq:,.2f} 现金 ${ac:,.2f}","success")
+        except Exception as e:
+            log(f"Alpaca 资金同步失败: {e}","warning")
         alpaca_sync_positions()
 
     data=load()
@@ -1924,6 +1937,12 @@ def api_scan():
     threading.Thread(target=run_cycle_bg,daemon=True).start()
     return jsonify({"ok":True})
 
+@app.route("/api/force_trade",methods=["POST"])
+def api_force_trade():
+    if scan_status["running"]: return jsonify({"ok":False,"msg":"扫描中"})
+    threading.Thread(target=run_cycle_bg,daemon=True).start()
+    return jsonify({"ok":True,"message":"已触发交易，请查看扫描日志"})
+
 @app.route("/api/scan_status")
 def api_scan_status(): return jsonify(scan_status)
 
@@ -2034,6 +2053,41 @@ def api_reset_baseline():
     data["base_nav"]=total
     save(data)
     return jsonify({"ok":True,"base_nav":round(total,2)})
+
+@app.route("/api/alpaca_balance")
+def api_alpaca_balance():
+    if not alpaca_enabled:
+        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
+    acct = alpaca_get_account()
+    if "error" in (acct or {}):
+        return jsonify({"ok":False,"msg":acct.get("error","")})
+    eq = float(acct.get("equity", 0))
+    ac = float(acct.get("cash", 0))
+    data = load()
+    local_init = CONFIG["INITIAL_CASH"]
+    local_cash = data["cash"]
+    in_sync = abs(eq - local_init) / max(local_init, 1) < 0.01
+    return jsonify({"ok":True,"alpaca_equity":round(eq,2),"alpaca_cash":round(ac,2),
+        "local_initial":round(local_init,2),"local_cash":round(local_cash,2),"in_sync":in_sync})
+
+@app.route("/api/sync_balance",methods=["POST"])
+def api_sync_balance():
+    if not alpaca_enabled:
+        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
+    acct = alpaca_get_account()
+    if "error" in (acct or {}):
+        return jsonify({"ok":False,"msg":acct.get("error","")})
+    eq = float(acct.get("equity", 0))
+    ac = float(acct.get("cash", 0))
+    if eq < 1000:
+        return jsonify({"ok":False,"msg":f"Alpaca 余额过低 ${eq:,.2f}"})
+    data = load()
+    CONFIG["INITIAL_CASH"] = eq
+    data["initial_cash"] = eq
+    data["base_nav"] = eq
+    data["cash"] = ac
+    save(data)
+    return jsonify({"ok":True,"equity":round(eq,2),"cash":round(ac,2)})
 
 @app.route("/api/alpaca_auto_capital",methods=["POST"])
 def api_alpaca_auto_capital():
@@ -2217,7 +2271,8 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <span id="alpaca-cash" style="font-size:12px;color:var(--muted)">现金 —</span>
     <span id="alpaca-market" style="font-size:11px;padding:2px 8px;border-radius:4px;background:var(--card);color:var(--muted)">市场 —</span>
     <span id="auto-trade-badge" style="font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer" onclick="toggleAutoTrade()">—</span>
-    <button onclick="syncAlpaca()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步持仓</button>
+    <button onclick="syncBalance()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步资金</button>
+    <button onclick="syncAlpaca()" style="padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步持仓</button>
   </div>
   <div id="schedule-card" style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
     <div style="display:flex;align-items:center;gap:6px">
@@ -2397,7 +2452,7 @@ const pct=n=>n==null?'—':(n>=0?'+':'')+Number(n).toFixed(2)+'%';
 const cc=n=>n>0?'green':n<0?'red':'';
 async function load(){
   const r=await fetch('/api/portfolio');portfolio=await r.json();
-  renderDash();renderSectors();renderPositions();renderTrades();updateSettingsPage();
+  renderDash();renderSectors();renderPositions();renderTrades();updateSettingsPage();updateScanBtn();
 }
 function renderDash(){
   const p=portfolio;
@@ -2536,7 +2591,12 @@ async function doScan(){
   document.getElementById('pbar-wrap').style.display='block';
   document.getElementById('scan-log').innerHTML='';
   document.getElementById('sig-list').innerHTML='';
-  await fetch('/api/scan',{method:'POST'});
+  // switch to signals tab
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
+  document.getElementById('page-signals').classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(x=>{if(x.textContent.includes('信号'))x.classList.add('active');});
+  await fetch('/api/force_trade',{method:'POST'});
   scanPoll=setInterval(pollScan,900);
 }
 async function pollScan(){
@@ -2570,7 +2630,7 @@ async function pollScan(){
   if(!s.running){
     clearInterval(scanPoll);
     const btn=document.getElementById('scan-btn');
-    btn.disabled=false;btn.textContent='▶ 立即扫描';btn.classList.remove('running');
+    btn.disabled=false;btn.classList.remove('running');updateScanBtn();
     document.getElementById('last-scan').textContent='最后: '+new Date().toLocaleTimeString('zh');
     document.getElementById('phase').textContent='';
     setTimeout(load,600);
@@ -2851,6 +2911,24 @@ async function loadAlpacaStatus(){
 async function syncAlpaca(){
   await fetch('/api/alpaca_sync',{method:'POST'});
   await load();loadAlpacaStatus();
+}
+function updateScanBtn(){
+  const btn=document.getElementById('scan-btn');
+  const hasPos=(portfolio.positions||[]).length>0;
+  btn.textContent=hasPos?'▶ 立即扫描':'▶ 立即扫描并建仓';
+  btn.style.background=hasPos?'':'var(--green)';
+  btn.style.color=hasPos?'':'#fff';
+}
+async function syncBalance(){
+  try{
+    const r=await fetch('/api/alpaca_balance');const d=await r.json();
+    if(d.error){alert('获取Alpaca资金失败: '+d.error);return;}
+    const msg=`Alpaca账户:\n  权益: $${Number(d.alpaca_equity).toLocaleString()}\n  现金: $${Number(d.alpaca_cash).toLocaleString()}\n\n本地系统:\n  基准资金: $${Number(d.local_initial).toLocaleString()}\n  现金: $${Number(d.local_cash).toLocaleString()}\n\n是否将Alpaca资金同步到本地系统？`;
+    if(!confirm(msg))return;
+    await fetch('/api/sync_balance',{method:'POST'});
+    await load();loadAlpacaStatus();
+    alert('资金已同步');
+  }catch(e){alert('同步失败: '+e.message);}
 }
 
 async function checkAlpacaCapital(){
