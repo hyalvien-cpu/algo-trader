@@ -1461,9 +1461,14 @@ def sim_buy(data, ticker, price, usd, analysis):
     # Alpaca 模拟盘同步下单
     if alpaca_enabled:
         try:
-            order = alpaca_place_order(ticker, "buy", usd)
-            if "id" in order:
-                data["positions"][ticker]["alpaca_order_id"] = order["id"]
+            acct = alpaca_get_account()
+            bp = float(acct.get("buying_power", 0))
+            if bp < usd:
+                print(f"[Alpaca] Alpaca 可用资金不足（${bp:,.2f} < ${usd:,.2f}），仅本地模拟")
+            else:
+                order = alpaca_place_order(ticker, "buy", usd)
+                if "id" in order:
+                    data["positions"][ticker]["alpaca_order_id"] = order["id"]
         except Exception:
             pass
     return True,f"买入 {ticker} {shares:.4f}股 @ ${price:.2f} 仓位${usd:,.0f}"
