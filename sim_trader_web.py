@@ -24,6 +24,61 @@ app = Flask(__name__)
 
 ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "")
 
+# ══════════════════════════════════════════════════════
+#  Alpaca Paper Trading（模拟盘）
+# ══════════════════════════════════════════════════════
+
+ALPACA_KEY    = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
+ALPACA_URL    = "https://paper-api.alpaca.markets"
+alpaca_enabled = bool(ALPACA_KEY and ALPACA_SECRET)
+
+def alpaca_request(method, path, data=None):
+    """统一的 Alpaca API 请求函数"""
+    import requests as req
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        "Content-Type": "application/json",
+    }
+    url = ALPACA_URL + path
+    try:
+        if method == "GET":
+            r = req.get(url, headers=headers, timeout=10)
+        elif method == "POST":
+            r = req.post(url, headers=headers, json=data, timeout=10)
+        elif method == "DELETE":
+            r = req.delete(url, headers=headers, timeout=10)
+        else:
+            return {}
+        return r.json() if r.ok else {"error": r.text}
+    except Exception as e:
+        return {"error": str(e)}
+
+def alpaca_get_account():
+    return alpaca_request("GET", "/v2/account")
+
+def alpaca_get_positions():
+    return alpaca_request("GET", "/v2/positions")
+
+def alpaca_place_order(ticker, side, usd_amount):
+    """市价按金额下单（支持分数股）"""
+    return alpaca_request("POST", "/v2/orders", {
+        "symbol": ticker,
+        "notional": str(round(usd_amount, 2)),
+        "side": side,
+        "type": "market",
+        "time_in_force": "day",
+    })
+
+def alpaca_close_position(ticker):
+    """清仓某只股票"""
+    return alpaca_request("DELETE", f"/v2/positions/{ticker}")
+
+def alpaca_is_market_open():
+    clock = alpaca_request("GET", "/v2/clock")
+    return clock.get("is_open", False)
+
 @app.before_request
 def check_auth():
     if not ACCESS_PASSWORD:
@@ -1403,6 +1458,14 @@ def sim_buy(data, ticker, price, usd, analysis):
         "patterns":list(analysis.get("patterns",{}).keys()),
         "sector":analysis.get("sector",""),
         "hold_days":analysis.get("suggested_hold_days",14)})
+    # Alpaca 模拟盘同步下单
+    if alpaca_enabled:
+        try:
+            order = alpaca_place_order(ticker, "buy", usd)
+            if "id" in order:
+                data["positions"][ticker]["alpaca_order_id"] = order["id"]
+        except Exception:
+            pass
     return True,f"买入 {ticker} {shares:.4f}股 @ ${price:.2f} 仓位${usd:,.0f}"
 
 def sim_sell(data, ticker, price, reason="SELL"):
@@ -1417,6 +1480,12 @@ def sim_sell(data, ticker, price, reason="SELL"):
         "action":reason,"ticker":ticker,"shares":round(p["shares"],4),
         "price":price,"amount":round(net,2),"pnl":round(pnl,2),
         "pnl_pct":round(pnl_pct,2),"hold_days":hold_days,"sector":p.get("sector","")})
+    # Alpaca 模拟盘同步清仓
+    if alpaca_enabled:
+        try:
+            alpaca_close_position(ticker)
+        except Exception:
+            pass
     del data["positions"][ticker]
     return True,f"卖出 {ticker} 盈亏${pnl:+.2f}({pnl_pct:+.1f}%) 持{hold_days}天"
 
@@ -1750,6 +1819,55 @@ def api_backtest():
     result = run_backtest(tickers, period_days=period)
     return jsonify(result)
 
+@app.route("/api/alpaca_status")
+def api_alpaca_status():
+    if not alpaca_enabled:
+        return jsonify({"enabled":False,"account":{},"market_open":False,"positions":[]})
+    return jsonify({
+        "enabled":True,
+        "account":alpaca_get_account(),
+        "market_open":alpaca_is_market_open(),
+        "positions":alpaca_get_positions(),
+    })
+
+@app.route("/api/alpaca_sync",methods=["POST"])
+def api_alpaca_sync():
+    if not alpaca_enabled:
+        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
+    data=load()
+    ap=alpaca_get_positions()
+    if isinstance(ap,dict) and "error" in ap:
+        return jsonify({"ok":False,"msg":ap["error"]})
+    synced=[]
+    for pos in ap:
+        ticker=pos.get("symbol","")
+        if not ticker: continue
+        price=float(pos.get("current_price",0))
+        shares=float(pos.get("qty",0))
+        mkt=float(pos.get("market_value",0))
+        avg_cost=float(pos.get("avg_entry_price",0))
+        if ticker in data["positions"]:
+            data["positions"][ticker]["shares"]=shares
+            data["positions"][ticker]["avg_cost"]=avg_cost
+        else:
+            data["positions"][ticker]={
+                "shares":shares,"avg_cost":avg_cost,
+                "buy_date":datetime.now().strftime("%Y-%m-%d"),
+                "target_sell_date":(datetime.now()+timedelta(days=14)).strftime("%Y-%m-%d"),
+                "hold_reason":"Alpaca同步","buy_score":0,"sector":"",
+                "peak_price":price,"trailing_drawdown":0.0,
+                "confidence_score":0,"confidence_level":"",
+            }
+        data["prices"][ticker]=price
+        synced.append(ticker)
+    # 移除 Alpaca 已清仓但本地还在的持仓
+    alpaca_tickers={pos.get("symbol","") for pos in ap}
+    for t in list(data["positions"].keys()):
+        if t not in alpaca_tickers and data["positions"][t].get("alpaca_order_id"):
+            del data["positions"][t]
+    save(data)
+    return jsonify({"ok":True,"synced":synced,"count":len(synced)})
+
 @app.route("/api/set_capital",methods=["POST"])
 def api_set_capital():
     body=request.get_json(force=True) or {}
@@ -1899,6 +2017,16 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <div class="card"><div class="clabel">累计盈亏</div><div class="cval" id="d-pnl">—</div><div class="csub" id="d-pct">—</div></div>
     <div class="card"><div class="clabel">可用现金</div><div class="cval" id="d-cash">—</div><div class="csub" id="d-cp">—</div></div>
     <div class="card"><div class="clabel">当前持仓</div><div class="cval" id="d-pos">—</div><div class="csub" id="d-pm">—</div></div>
+  </div>
+  <div id="alpaca-bar" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:18px;align-items:center;gap:16px;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:6px">
+      <div id="alpaca-dot" style="width:8px;height:8px;border-radius:50%;background:var(--muted)"></div>
+      <span style="font-size:12px;font-weight:500">Alpaca 模拟盘</span>
+    </div>
+    <span id="alpaca-equity" style="font-size:12px;font-family:var(--mono);color:var(--muted)">—</span>
+    <span id="alpaca-cash" style="font-size:12px;color:var(--muted)">现金 —</span>
+    <span id="alpaca-market" style="font-size:11px;padding:2px 8px;border-radius:4px;background:var(--card);color:var(--muted)">市场 —</span>
+    <button onclick="syncAlpaca()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步持仓</button>
   </div>
   <div class="chart-card"><div class="stitle">净值曲线</div><div class="cwrap"><canvas id="nav-chart"></canvas></div></div>
   <div class="box" style="margin-bottom:18px"><div class="stitle">🏛️ 宏观政策事件</div><div id="macro-mini"><div class="empty">扫描后可见</div></div></div>
@@ -2467,8 +2595,26 @@ async function resetAccount(){
   document.getElementById('set-msg').textContent='账户已重置';
 }
 
-load();loadSummaries();pollModelStatus();loadLiveNews();
-setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);
+async function loadAlpacaStatus(){
+  try{
+    const r=await fetch('/api/alpaca_status');const d=await r.json();
+    if(!d.enabled)return;
+    document.getElementById('alpaca-bar').style.display='flex';
+    document.getElementById('alpaca-dot').style.background=d.market_open?'var(--green)':'var(--muted)';
+    const acc=d.account||{};
+    document.getElementById('alpaca-equity').textContent=acc.equity?'$'+Number(acc.equity).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'—';
+    document.getElementById('alpaca-cash').textContent=acc.cash?'现金 $'+Number(acc.cash).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'现金 —';
+    document.getElementById('alpaca-market').textContent=d.market_open?'🟢 开市中':'⚫ 已休市';
+    document.getElementById('alpaca-market').style.color=d.market_open?'var(--green)':'var(--muted)';
+  }catch(e){}
+}
+async function syncAlpaca(){
+  await fetch('/api/alpaca_sync',{method:'POST'});
+  await load();loadAlpacaStatus();
+}
+
+load();loadSummaries();pollModelStatus();loadLiveNews();loadAlpacaStatus();
+setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);setInterval(loadAlpacaStatus,60000);
 </script></body></html>"""
 
 # ══════════════════════════════════════════════════════

@@ -4,3 +4,4 @@ apscheduler
 requests
 vaderSentiment
 gunicorn
+alpaca-py
