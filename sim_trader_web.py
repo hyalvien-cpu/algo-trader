@@ -277,6 +277,7 @@ def load():
         return json.loads(DATA_FILE.read_text("utf-8"))
     d = {"cash": CONFIG["INITIAL_CASH"], "positions": {}, "trades": [],
          "daily_nav": [], "prices": {}, "sector_scores": {},
+         "base_nav": CONFIG["INITIAL_CASH"],
          "created": datetime.now().strftime("%Y-%m-%d")}
     save(d); return d
 
@@ -1729,7 +1730,7 @@ def run_cycle_bg():
     scan_status["daily_summary"] = daily_summary
 
     save(data)
-    pnl=nav_val-CONFIG["INITIAL_CASH"]
+    pnl=nav_val-data.get("base_nav", CONFIG["INITIAL_CASH"])
     log(f"✅ 完成 | 总资产${nav_val:,.0f} | 累计${pnl:+,.0f} | 持仓{len(data['positions'])}/{CONFIG['MAX_POSITIONS']}","success")
     log(f"📋 今日摘要: {daily_summary['one_line']}","info")
     scan_status["running"]=False
@@ -1748,6 +1749,7 @@ def api_model_status():
 @app.route("/api/portfolio")
 def api_portfolio():
     data=load(); prices=data.get("prices",{}); total=portfolio_value(data,prices)
+    base=data.get("base_nav", CONFIG["INITIAL_CASH"])
     init=CONFIG["INITIAL_CASH"]
     positions=[]
     for ticker,p in data["positions"].items():
@@ -1772,11 +1774,11 @@ def api_portfolio():
             "confidence_score":p.get("confidence_score",0),
             "confidence_level":p.get("confidence_level","")})
     return jsonify({"cash":round(data["cash"],2),"total":round(total,2),
-        "pnl":round(total-init,2),"pnl_pct":round((total-init)/init*100,2),
+        "pnl":round(total-base,2),"pnl_pct":round((total-base)/base*100,2) if base else 0,
         "positions":positions,"nav":data.get("daily_nav",[])[-90:],
         "trades":data.get("trades",[])[-40:],"sector_scores":data.get("sector_scores",{}),
         "macro_adj":data.get("macro_adj",{}),
-        "config":{"initial":init,"max_pos":CONFIG["MAX_POSITIONS"]}})
+        "config":{"initial":init,"base_nav":round(base,2),"max_pos":CONFIG["MAX_POSITIONS"]}})
 
 @app.route("/api/scan",methods=["POST"])
 def api_scan():
@@ -1870,8 +1872,20 @@ def api_alpaca_sync():
     for t in list(data["positions"].keys()):
         if t not in alpaca_tickers and data["positions"][t].get("alpaca_order_id"):
             del data["positions"][t]
+    # 同步后自动更新 base_nav 基准线（首次同步或无基准时）
+    if synced and "base_nav" not in data:
+        data["base_nav"] = portfolio_value(data, data.get("prices", {}))
     save(data)
     return jsonify({"ok":True,"synced":synced,"count":len(synced)})
+
+@app.route("/api/reset_baseline",methods=["POST"])
+def api_reset_baseline():
+    data=load()
+    prices=data.get("prices",{})
+    total=portfolio_value(data,prices)
+    data["base_nav"]=total
+    save(data)
+    return jsonify({"ok":True,"base_nav":round(total,2)})
 
 @app.route("/api/set_capital",methods=["POST"])
 def api_set_capital():
@@ -2019,7 +2033,8 @@ tr:hover td{background:rgba(124,110,255,0.03)}
   <div class="ptitle">仪表盘</div>
   <div class="cards">
     <div class="card"><div class="clabel">总资产</div><div class="cval" id="d-total">—</div><div class="csub" id="d-init">—</div></div>
-    <div class="card"><div class="clabel">累计盈亏</div><div class="cval" id="d-pnl">—</div><div class="csub" id="d-pct">—</div></div>
+    <div class="card"><div class="clabel">累计盈亏</div><div class="cval" id="d-pnl">—</div><div class="csub" id="d-pct">—</div>
+      <div style="margin-top:6px"><button onclick="resetBaseline()" style="font-size:9px;padding:2px 8px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer">重置基准</button></div></div>
     <div class="card"><div class="clabel">可用现金</div><div class="cval" id="d-cash">—</div><div class="csub" id="d-cp">—</div></div>
     <div class="card"><div class="clabel">当前持仓</div><div class="cval" id="d-pos">—</div><div class="csub" id="d-pm">—</div></div>
   </div>
@@ -2209,7 +2224,7 @@ function renderDash(){
   const pe=document.getElementById('d-pnl');
   pe.textContent=(p.pnl>=0?'+':'')+fmt(p.pnl);pe.className='cval '+(p.pnl>=0?'green':'red');
   document.getElementById('d-pct').textContent=pct(p.pnl_pct)+' 总收益率';
-  document.getElementById('d-init').textContent='初始 '+fmt(p.config?.initial||100000);
+  document.getElementById('d-init').textContent='基准 '+fmt(p.config?.base_nav||p.config?.initial||100000);
   document.getElementById('d-cash').textContent=fmt(p.cash);
   document.getElementById('d-cp').textContent=p.total?pct(p.cash/p.total*100)+' 仓位':'—';
   document.getElementById('d-pos').textContent=p.positions?.length||0;
@@ -2592,6 +2607,11 @@ async function applyCapital(){
     else{msg.style.color='var(--red)';msg.textContent=d.msg||'修改失败';}
   }catch(e){msg.style.color='var(--red)';msg.textContent='请求失败';}
   btn.disabled=false;btn.textContent='确认修改';
+}
+async function resetBaseline(){
+  if(!confirm('将当前总资产设为新的盈亏基准线，累计盈亏将清零。确认？')) return;
+  await fetch('/api/reset_baseline',{method:'POST'});
+  await load();
 }
 async function resetAccount(){
   if(!confirm('确认重置？所有持仓和交易记录将被清空，此操作不可撤销！')) return;
