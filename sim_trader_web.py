@@ -1161,6 +1161,7 @@ def calc_position_size(total_capital, score, confidence, current_positions, max_
 def sector_count(positions):
     counts = {}
     for t, p in positions.items():
+        if p.get("source","local") != "local": continue
         s = p.get("sector", "")
         if s:
             counts[s] = counts.get(s, 0) + 1
@@ -1176,6 +1177,7 @@ def is_sector_full(positions, sector):
 def update_trailing_stop(positions, prices):
     triggered = []
     for ticker, p in positions.items():
+        if p.get("source","local") != "local": continue
         price = prices.get(ticker)
         if not price:
             continue
@@ -1426,9 +1428,18 @@ def run_backtest(tickers, period_days=180, initial_cash=100000):
 #  交易执行
 # ══════════════════════════════════════════════════════
 
+def local_positions(data):
+    """返回只含 source=local 的持仓字典"""
+    return {k:v for k,v in data["positions"].items() if v.get("source","local")=="local"}
+
+def local_pos_count(data):
+    return sum(1 for v in data["positions"].values() if v.get("source","local")=="local")
+
 def portfolio_value(data, prices):
+    """只计算 source=local 的持仓市值 + 现金"""
     return data["cash"] + sum(
-        v["shares"]*prices.get(k,v["avg_cost"]) for k,v in data["positions"].items())
+        v["shares"]*prices.get(k,v["avg_cost"]) for k,v in data["positions"].items()
+        if v.get("source","local")=="local")
 
 def sim_buy(data, ticker, price, usd, analysis):
     # 板块集中度双重检查
@@ -1455,6 +1466,7 @@ def sim_buy(data, ticker, price, usd, analysis):
             "trailing_drawdown": 0.0,
             "confidence_score": conf.get("score", 0),
             "confidence_level": conf.get("level", ""),
+            "source": "local",
         }
     data["cash"]-=(usd+comm)
     data["trades"].append({"time":datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1493,7 +1505,8 @@ def sim_sell(data, ticker, price, reason="SELL"):
     pnl=net-p["shares"]*p["avg_cost"]
     pnl_pct=pnl/(p["shares"]*p["avg_cost"])*100
     hold_days=(datetime.now()-datetime.strptime(p.get("buy_date",datetime.now().strftime("%Y-%m-%d")),"%Y-%m-%d")).days
-    data["cash"]+=net
+    if p.get("source","local")=="local":
+        data["cash"]+=net
     data["trades"].append({"time":datetime.now().strftime("%Y-%m-%d %H:%M"),
         "action":reason,"ticker":ticker,"shares":round(p["shares"],4),
         "price":price,"amount":round(net,2),"pnl":round(pnl,2),
@@ -1517,7 +1530,7 @@ scan_status={"running":False,"log":[],"progress":0,"total":0,
              "phase":"","sector_scores":{},"analyses":[]}
 
 def alpaca_sync_positions():
-    """同步 Alpaca 持仓到本地（扫描前调用）"""
+    """同步 Alpaca 持仓到本地（扫描前调用）。只更新 source=alpaca 的记录，不影响 local。"""
     if not alpaca_enabled:
         return
     try:
@@ -1535,11 +1548,25 @@ def alpaca_sync_positions():
             price = float(pos.get("current_price", 0))
             shares = float(pos.get("qty", 0))
             avg_cost = float(pos.get("avg_entry_price", 0))
-            if ticker in data["positions"]:
-                data["positions"][ticker]["shares"] = shares
-                data["positions"][ticker]["avg_cost"] = avg_cost
+            # 用 alpaca_ 前缀的 key 存 Alpaca 持仓，不覆盖 local 持仓
+            akey = f"_alpaca_{ticker}"
+            if akey in data["positions"]:
+                data["positions"][akey]["shares"] = shares
+                data["positions"][akey]["avg_cost"] = avg_cost
+                data["positions"][akey]["peak_price"] = max(data["positions"][akey].get("peak_price", price), price)
+            elif ticker in data["positions"] and data["positions"][ticker].get("source") == "alpaca":
+                # 迁移旧格式的 alpaca 记录
+                old = data["positions"].pop(ticker)
+                old["shares"] = shares
+                old["avg_cost"] = avg_cost
+                data["positions"][akey] = old
             else:
-                data["positions"][ticker] = {
+                # 新 Alpaca 持仓（不是本地买入的）
+                # 跳过已有 local 持仓的同名 ticker（本地下单的已同步到 Alpaca）
+                if ticker in data["positions"] and data["positions"][ticker].get("source","local") == "local":
+                    data["prices"][ticker] = price
+                    continue
+                data["positions"][akey] = {
                     "shares": shares, "avg_cost": avg_cost,
                     "buy_date": datetime.now().strftime("%Y-%m-%d"),
                     "target_sell_date": (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
@@ -1549,13 +1576,15 @@ def alpaca_sync_positions():
                     "source": "alpaca",
                 }
                 print(f"[Alpaca同步] 新增持仓 {ticker} {shares}股 @ ${avg_cost:.2f}")
+            data["prices"][akey] = price
             data["prices"][ticker] = price
-        # 本地有但 Alpaca 没有 → 已被平仓
+        # 移除 Alpaca 已清仓的 source=alpaca 记录
         for t in list(data["positions"].keys()):
-            if t not in alpaca_tickers and data["positions"][t].get("source") == "alpaca":
-                price = data["prices"].get(t, data["positions"][t]["avg_cost"])
-                print(f"[Alpaca同步] {t} 已在Alpaca平仓，同步移除")
-                del data["positions"][t]
+            if data["positions"][t].get("source") == "alpaca":
+                real_ticker = t.replace("_alpaca_", "")
+                if real_ticker not in alpaca_tickers:
+                    print(f"[Alpaca同步] {real_ticker} 已在Alpaca平仓，同步移除")
+                    del data["positions"][t]
         save(data)
     except Exception as e:
         print(f"[Alpaca同步] 出错: {e}")
@@ -1638,7 +1667,7 @@ def run_cycle_bg():
 
     # Phase 2: 检查持仓
     scan_status["phase"]="检查持仓"
-    held_tickers = list(data["positions"].keys())
+    held_tickers = [t for t,p in data["positions"].items() if p.get("source","local")=="local"]
     held_prices=get_prices(held_tickers)
     data["prices"].update(held_prices)
     total=portfolio_value(data,data["prices"])
@@ -1680,7 +1709,7 @@ def run_cycle_bg():
         effective_stop = CONFIG["STOP_LOSS"] * 0.7  # -4.9% instead of -7%
         log(f"⚠️ 宏观极度利空，止损线收紧至 {effective_stop*100:.1f}%","warning")
 
-    for ticker in list(data["positions"].keys()):
+    for ticker in [t for t in list(data["positions"].keys()) if data["positions"][t].get("source","local")=="local"]:
         price=held_prices.get(ticker)
         if not price: continue
         p=data["positions"][ticker]
@@ -1780,12 +1809,12 @@ def run_cycle_bg():
     total=portfolio_value(data,data["prices"])
     for a in candidates:
         if not auto_enabled: break
-        if len(data["positions"])>=CONFIG["MAX_POSITIONS"]: break
+        if local_pos_count(data)>=CONFIG["MAX_POSITIONS"]: break
         price=a.get("price") or get_prices([a["ticker"]]).get(a["ticker"])
         if not price: continue
         conf = a.get("confidence", {})
         pos_size = calc_position_size(total, a["score"], conf.get("score", 50),
-                                       len(data["positions"]), CONFIG["MAX_POSITIONS"])
+                                       local_pos_count(data), CONFIG["MAX_POSITIONS"])
         ok,msg=sim_buy(data,a["ticker"],price,pos_size,a)
         log(f"📥 {msg} | 置信{conf.get('score',0)} {conf.get('level','')} | 持{a['suggested_hold_days']}天 | {a['hold_reason'][:40]}","success" if ok else "warning")
 
@@ -1793,7 +1822,7 @@ def run_cycle_bg():
     CONFIG["MIN_SCORE"] = 58
 
     # Phase 5: 净值快照
-    new_prices=get_prices(list(data["positions"].keys()))
+    new_prices=get_prices([t for t,p in data["positions"].items() if p.get("source","local")=="local"])
     data["prices"].update(new_prices)
     nav_val=portfolio_value(data,data["prices"])
     today=datetime.now().strftime("%Y-%m-%d")
@@ -1819,7 +1848,7 @@ def run_cycle_bg():
 
     save(data)
     pnl=nav_val-data.get("base_nav", CONFIG["INITIAL_CASH"])
-    log(f"✅ 完成 | 总资产${nav_val:,.0f} | 累计${pnl:+,.0f} | 持仓{len(data['positions'])}/{CONFIG['MAX_POSITIONS']}","success")
+    log(f"✅ 完成 | 总资产${nav_val:,.0f} | 累计${pnl:+,.0f} | 持仓{local_pos_count(data)}/{CONFIG['MAX_POSITIONS']}","success")
     log(f"📋 今日摘要: {daily_summary['one_line']}","info")
     scan_status["running"]=False
 
@@ -1840,17 +1869,21 @@ def api_portfolio():
     base=data.get("base_nav", CONFIG["INITIAL_CASH"])
     init=CONFIG["INITIAL_CASH"]
     positions=[]
+    alpaca_positions=[]
     for ticker,p in data["positions"].items():
+        source=p.get("source","local")
+        display_ticker=ticker.replace("_alpaca_","") if ticker.startswith("_alpaca_") else ticker
         price=prices.get(ticker,p["avg_cost"]); mkt=p["shares"]*price; cost=p["shares"]*p["avg_cost"]
         hold_days=(datetime.now()-datetime.strptime(p.get("buy_date",datetime.now().strftime("%Y-%m-%d")),"%Y-%m-%d")).days
         days_left=0
         if p.get("target_sell_date"):
             try: days_left=max(0,(datetime.strptime(p["target_sell_date"],"%Y-%m-%d")-datetime.now()).days)
             except: pass
-        positions.append({"ticker":ticker,"shares":round(p["shares"],4),"avg_cost":p["avg_cost"],
+        ref_total = total if source=="local" else mkt  # alpaca 持仓 weight 用自身
+        row={"ticker":display_ticker,"shares":round(p["shares"],4),"avg_cost":p["avg_cost"],
             "price":price,"mkt":round(mkt,2),"cost":round(cost,2),
             "pnl":round(mkt-cost,2),"pnl_pct":round((mkt-cost)/cost*100,2) if cost else 0,
-            "weight":round(mkt/total*100,1) if total else 0,
+            "weight":round(mkt/total*100,1) if total and source=="local" else 0,
             "buy_date":p.get("buy_date",""),"target_sell_date":p.get("target_sell_date",""),
             "hold_days":hold_days,"days_left":days_left,
             "hold_reason":p.get("hold_reason",""),"sector":p.get("sector",""),
@@ -1860,10 +1893,16 @@ def api_portfolio():
             "peak_price":round(p.get("peak_price",price),2),
             "trailing_drawdown":round(p.get("trailing_drawdown",0)*100,1),
             "confidence_score":p.get("confidence_score",0),
-            "confidence_level":p.get("confidence_level","")})
+            "confidence_level":p.get("confidence_level",""),
+            "source":source}
+        if source=="local":
+            positions.append(row)
+        else:
+            alpaca_positions.append(row)
     return jsonify({"cash":round(data["cash"],2),"total":round(total,2),
         "pnl":round(total-base,2),"pnl_pct":round((total-base)/base*100,2) if base else 0,
-        "positions":positions,"nav":data.get("daily_nav",[])[-90:],
+        "positions":positions,"alpaca_positions":alpaca_positions,
+        "nav":data.get("daily_nav",[])[-90:],
         "trades":data.get("trades",[])[-40:],"sector_scores":data.get("sector_scores",{}),
         "macro_adj":data.get("macro_adj",{}),
         "config":{"initial":init,"base_nav":round(base,2),"max_pos":CONFIG["MAX_POSITIONS"]}})
@@ -1929,42 +1968,8 @@ def api_alpaca_status():
 def api_alpaca_sync():
     if not alpaca_enabled:
         return jsonify({"ok":False,"msg":"Alpaca 未启用"})
-    data=load()
-    ap=alpaca_get_positions()
-    if isinstance(ap,dict) and "error" in ap:
-        return jsonify({"ok":False,"msg":ap["error"]})
-    synced=[]
-    for pos in ap:
-        ticker=pos.get("symbol","")
-        if not ticker: continue
-        price=float(pos.get("current_price",0))
-        shares=float(pos.get("qty",0))
-        mkt=float(pos.get("market_value",0))
-        avg_cost=float(pos.get("avg_entry_price",0))
-        if ticker in data["positions"]:
-            data["positions"][ticker]["shares"]=shares
-            data["positions"][ticker]["avg_cost"]=avg_cost
-        else:
-            data["positions"][ticker]={
-                "shares":shares,"avg_cost":avg_cost,
-                "buy_date":datetime.now().strftime("%Y-%m-%d"),
-                "target_sell_date":(datetime.now()+timedelta(days=14)).strftime("%Y-%m-%d"),
-                "hold_reason":"Alpaca同步","buy_score":0,"sector":"",
-                "peak_price":price,"trailing_drawdown":0.0,
-                "confidence_score":0,"confidence_level":"",
-            }
-        data["prices"][ticker]=price
-        synced.append(ticker)
-    # 移除 Alpaca 已清仓但本地还在的持仓
-    alpaca_tickers={pos.get("symbol","") for pos in ap}
-    for t in list(data["positions"].keys()):
-        if t not in alpaca_tickers and data["positions"][t].get("alpaca_order_id"):
-            del data["positions"][t]
-    # 同步后自动更新 base_nav 基准线（首次同步或无基准时）
-    if synced and "base_nav" not in data:
-        data["base_nav"] = portfolio_value(data, data.get("prices", {}))
-    save(data)
-    return jsonify({"ok":True,"synced":synced,"count":len(synced)})
+    alpaca_sync_positions()
+    return jsonify({"ok":True})
 
 @app.route("/api/auto_trade_toggle",methods=["POST"])
 def api_auto_trade_toggle():
@@ -2208,7 +2213,7 @@ tr:hover td{background:rgba(124,110,255,0.03)}
 <div class="page" id="page-positions">
   <div class="ptitle">持仓明细</div>
   <div class="box" style="overflow-x:auto">
-    <table><thead><tr><th>代码</th><th>板块</th><th>成本</th><th>现价</th><th>市值</th>
+    <table><thead><tr><th>代码</th><th>来源</th><th>板块</th><th>成本</th><th>现价</th><th>市值</th>
       <th>盈亏</th><th>收益率</th><th>持天</th><th>目标卖出日</th><th>置信度</th><th>财报</th><th>移动止损</th><th>持仓理由</th>
     </tr></thead><tbody id="pos-table"></tbody></table>
   </div>
@@ -2451,13 +2456,19 @@ function renderSectors(){
     </div>`;}).join('')+'</div>';
 }
 function renderPositions(){
-  const rows=portfolio.positions||[];
+  const local=portfolio.positions||[];
+  const alpaca=portfolio.alpaca_positions||[];
+  const rows=[...local,...alpaca];
   document.getElementById('pos-table').innerHTML=rows.length?rows.map(p=>{
+    const isAlpaca=p.source==='alpaca';
+    const rowStyle=isAlpaca?'opacity:0.7':'';
+    const srcTag=isAlpaca?'<span style="font-size:9px;padding:1px 5px;background:rgba(90,90,120,0.2);border-radius:3px;color:var(--muted)">Alpaca</span>':'<span style="font-size:9px;padding:1px 5px;background:rgba(124,110,255,0.12);border-radius:3px;color:var(--accent)">本地</span>';
     const prog=Math.max(0,Math.min(100,(1-p.days_left/Math.max(p.hold_days||14,1))*100));
     const tdCol=Math.abs(p.trailing_drawdown||0)>5?'var(--red)':Math.abs(p.trailing_drawdown||0)>3?'var(--yellow)':'var(--muted)';
     const confCol=p.confidence_score>=70?'var(--green)':p.confidence_score>=50?'var(--yellow)':'var(--muted)';
-    return`<tr>
+    return`<tr style="${rowStyle}">
       <td><span class="badge ba">${p.ticker}</span></td>
+      <td>${srcTag}</td>
       <td style="font-size:10px;color:var(--muted)">${p.sector||'—'}</td>
       <td>${fmt(p.avg_cost)}</td><td>${fmt(p.price)}</td><td>${fmt(p.mkt)}</td>
       <td class="${cc(p.pnl)}">${(p.pnl>=0?'+':'')+fmt(p.pnl)}</td>
@@ -2471,7 +2482,7 @@ function renderPositions(){
       <td style="font-size:10px">${p.earnings_date||'—'}${p.earnings_warning?'<br><span style="font-size:9px">'+p.earnings_warning+'</span>':''}</td>
       <td style="font-size:10px;color:${tdCol}">${p.trailing_drawdown!=null?p.trailing_drawdown.toFixed(1)+'%':'—'}<br><span style="font-size:9px;color:var(--muted)">峰${fmt(p.peak_price)}</span></td>
       <td style="font-size:10px;color:var(--muted);max-width:150px">${p.hold_reason||'—'}</td>
-    </tr>`;}).join(''):'<tr><td colspan="13"><div class="empty">暂无持仓</div></td></tr>';
+    </tr>`;}).join(''):'<tr><td colspan="14"><div class="empty">暂无持仓</div></td></tr>';
 }
 function renderTrades(){
   const trades=(portfolio.trades||[]).slice().reverse();
