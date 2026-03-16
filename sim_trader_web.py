@@ -1600,8 +1600,19 @@ def run_premarket_analysis():
         data["sector_scores"] = sector_scores
         macro_adj = analyze_macro_events(macro_news)
         data["macro_adj"] = macro_adj
-        save(data)
+        sorted_s = sorted(sector_scores.items(), key=lambda x: -x[1]["heat"])
+        top_sectors = [n for n, _ in sorted_s[:CONFIG["TOP_SECTORS"]]]
         bias_text = "利空" if macro_adj["market_bias"] < 0 else "利好" if macro_adj["market_bias"] > 0 else "中性"
+        data["pre_market_analysis"] = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "news_count": len(news),
+            "macro_news_count": len(macro_news),
+            "macro_bias": macro_adj["market_bias"],
+            "macro_summary": macro_adj.get("summary", ""),
+            "top_sectors": top_sectors,
+            "events": [e["name"] for e in macro_adj.get("events", [])],
+        }
+        save(data)
         print(f"[盘前准备] 完成 | {len(news)}条新闻 | 宏观{bias_text} | {macro_adj['summary']}")
     except Exception as e:
         print(f"[盘前准备] 出错: {e}")
@@ -2035,7 +2046,7 @@ def api_set_capital():
     old_init=CONFIG["INITIAL_CASH"]
     # 计算当前持仓市值
     prices=data.get("prices",{})
-    pos_value=sum(p["shares"]*prices.get(t,p["avg_cost"]) for t,p in data["positions"].items())
+    pos_value=sum(p["shares"]*prices.get(t,p["avg_cost"]) for t,p in data["positions"].items() if p.get("source","local")=="local")
     if new_capital<pos_value:
         return jsonify({"ok":False,"msg":f"新资金量不能低于当前持仓市值 ${pos_value:,.0f}"})
     # 更新 CONFIG 和 data（持久化到文件）
@@ -2213,7 +2224,7 @@ tr:hover td{background:rgba(124,110,255,0.03)}
 <div class="page" id="page-positions">
   <div class="ptitle">持仓明细</div>
   <div class="box" style="overflow-x:auto">
-    <table><thead><tr><th>代码</th><th>来源</th><th>板块</th><th>成本</th><th>现价</th><th>市值</th>
+    <table><thead><tr><th>代码</th><th>板块</th><th>成本</th><th>现价</th><th>市值</th>
       <th>盈亏</th><th>收益率</th><th>持天</th><th>目标卖出日</th><th>置信度</th><th>财报</th><th>移动止损</th><th>持仓理由</th>
     </tr></thead><tbody id="pos-table"></tbody></table>
   </div>
@@ -2462,13 +2473,12 @@ function renderPositions(){
   document.getElementById('pos-table').innerHTML=rows.length?rows.map(p=>{
     const isAlpaca=p.source==='alpaca';
     const rowStyle=isAlpaca?'opacity:0.7':'';
-    const srcTag=isAlpaca?'<span style="font-size:9px;padding:1px 5px;background:rgba(90,90,120,0.2);border-radius:3px;color:var(--muted)">Alpaca</span>':'<span style="font-size:9px;padding:1px 5px;background:rgba(124,110,255,0.12);border-radius:3px;color:var(--accent)">本地</span>';
+    const alpacaTag=isAlpaca?' <span style="font-size:9px;padding:1px 4px;border-radius:3px;background:rgba(124,110,255,0.15);color:#7c6eff">Alpaca</span>':'';
     const prog=Math.max(0,Math.min(100,(1-p.days_left/Math.max(p.hold_days||14,1))*100));
     const tdCol=Math.abs(p.trailing_drawdown||0)>5?'var(--red)':Math.abs(p.trailing_drawdown||0)>3?'var(--yellow)':'var(--muted)';
     const confCol=p.confidence_score>=70?'var(--green)':p.confidence_score>=50?'var(--yellow)':'var(--muted)';
     return`<tr style="${rowStyle}">
-      <td><span class="badge ba">${p.ticker}</span></td>
-      <td>${srcTag}</td>
+      <td><span class="badge ba">${p.ticker}</span>${alpacaTag}</td>
       <td style="font-size:10px;color:var(--muted)">${p.sector||'—'}</td>
       <td>${fmt(p.avg_cost)}</td><td>${fmt(p.price)}</td><td>${fmt(p.mkt)}</td>
       <td class="${cc(p.pnl)}">${(p.pnl>=0?'+':'')+fmt(p.pnl)}</td>
@@ -2482,7 +2492,7 @@ function renderPositions(){
       <td style="font-size:10px">${p.earnings_date||'—'}${p.earnings_warning?'<br><span style="font-size:9px">'+p.earnings_warning+'</span>':''}</td>
       <td style="font-size:10px;color:${tdCol}">${p.trailing_drawdown!=null?p.trailing_drawdown.toFixed(1)+'%':'—'}<br><span style="font-size:9px;color:var(--muted)">峰${fmt(p.peak_price)}</span></td>
       <td style="font-size:10px;color:var(--muted);max-width:150px">${p.hold_reason||'—'}</td>
-    </tr>`;}).join(''):'<tr><td colspan="14"><div class="empty">暂无持仓</div></td></tr>';
+    </tr>`;}).join(''):'<tr><td colspan="13"><div class="empty">暂无持仓</div></td></tr>';
 }
 function renderTrades(){
   const trades=(portfolio.trades||[]).slice().reverse();
