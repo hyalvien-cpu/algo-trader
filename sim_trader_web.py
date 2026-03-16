@@ -2923,7 +2923,15 @@ async function syncBalance(){
   try{
     const r=await fetch('/api/alpaca_balance');const d=await r.json();
     if(d.error){alert('获取Alpaca资金失败: '+d.error);return;}
-    const msg=`Alpaca账户:\n  权益: $${Number(d.alpaca_equity).toLocaleString()}\n  现金: $${Number(d.alpaca_cash).toLocaleString()}\n\n本地系统:\n  基准资金: $${Number(d.local_initial).toLocaleString()}\n  现金: $${Number(d.local_cash).toLocaleString()}\n\n是否将Alpaca资金同步到本地系统？`;
+    const msg=`Alpaca账户:
+  权益: $${Number(d.alpaca_equity).toLocaleString()}
+  现金: $${Number(d.alpaca_cash).toLocaleString()}
+
+本地系统:
+  基准资金: $${Number(d.local_initial).toLocaleString()}
+  现金: $${Number(d.local_cash).toLocaleString()}
+
+是否将Alpaca资金同步到本地系统？`;
     if(!confirm(msg))return;
     await fetch('/api/sync_balance',{method:'POST'});
     await load();loadAlpacaStatus();
@@ -2941,9 +2949,13 @@ async function checkAlpacaCapital(){
     // 资金差异超过5%才提示
     if(Math.abs(eq-cur)/cur<0.05)return;
     const yes=confirm(
-      'Alpaca 模拟盘资金: $'+eq.toLocaleString('en-US',{minimumFractionDigits:2})+
-      '\n当前本地资金: $'+cur.toLocaleString('en-US',{minimumFractionDigits:2})+
-      '\n\n是否同步 Alpaca 资金量？\n\n点击「确定」自动同步\n点击「取消」手动设置');
+      `Alpaca 模拟盘资金: $${eq.toLocaleString('en-US',{minimumFractionDigits:2})}
+当前本地资金: $${cur.toLocaleString('en-US',{minimumFractionDigits:2})}
+
+是否同步 Alpaca 资金量？
+
+点击「确定」自动同步
+点击「取消」手动设置`);
     if(yes){
       await fetch('/api/alpaca_auto_capital',{method:'POST'});
       await load();
