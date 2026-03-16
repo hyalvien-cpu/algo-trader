@@ -1,0 +1,6 @@
+flask
+yfinance
+apscheduler
+requests
+vaderSentiment
+gunicorn
