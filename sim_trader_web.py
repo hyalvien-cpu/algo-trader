@@ -2090,6 +2090,36 @@ def api_sync_balance():
     save(data)
     return jsonify({"ok":True,"equity":round(eq,2)})
 
+@app.route("/api/full_sync",methods=["POST"])
+def api_full_sync():
+    """全量同步：以 Alpaca 数据为准重置本地账户"""
+    if not alpaca_enabled:
+        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
+    acct = alpaca_get_account()
+    if "error" in (acct or {}):
+        return jsonify({"ok":False,"msg":acct.get("error","")})
+    eq = float(acct.get("equity", 0))
+    if eq < 1000:
+        return jsonify({"ok":False,"msg":f"Alpaca 余额过低 ${eq:,.2f}"})
+    # 重置资金基准
+    data = load()
+    CONFIG["INITIAL_CASH"] = eq
+    data["initial_cash"] = eq
+    data["base_nav"] = eq
+    data["cash"] = eq
+    # 清空所有持仓，由 alpaca_sync_positions 重建
+    data["positions"] = {}
+    save(data)
+    # 同步 Alpaca 持仓
+    alpaca_sync_positions()
+    # 重新计算 cash = equity - 同步进来的持仓市值
+    data = load()
+    local_mkt = sum(p["shares"] * data.get("prices",{}).get(t, p["avg_cost"])
+                    for t, p in data["positions"].items())
+    data["cash"] = eq - local_mkt
+    save(data)
+    return jsonify({"ok":True,"equity":round(eq,2)})
+
 @app.route("/api/alpaca_auto_capital",methods=["POST"])
 def api_alpaca_auto_capital():
     """从 Alpaca 账户读取 equity 自动设置为本地资金量"""
@@ -2271,8 +2301,7 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <span id="alpaca-cash" style="font-size:12px;color:var(--muted)">现金 —</span>
     <span id="alpaca-market" style="font-size:11px;padding:2px 8px;border-radius:4px;background:var(--card);color:var(--muted)">市场 —</span>
     <span id="auto-trade-badge" style="font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer" onclick="toggleAutoTrade()">—</span>
-    <button onclick="syncBalance()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步资金</button>
-    <button onclick="syncAlpaca()" style="padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">同步持仓</button>
+    <button onclick="fullSync()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">全量同步</button>
   </div>
   <div id="schedule-card" style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
     <div style="display:flex;align-items:center;gap:6px">
@@ -2908,10 +2937,6 @@ async function loadAlpacaStatus(){
     document.getElementById('alpaca-market').style.color=d.market_open?'var(--green)':'var(--muted)';
   }catch(e){}
 }
-async function syncAlpaca(){
-  await fetch('/api/alpaca_sync',{method:'POST'});
-  await load();loadAlpacaStatus();
-}
 function updateScanBtn(){
   const btn=document.getElementById('scan-btn');
   const hasPos=(portfolio.positions||[]).length>0;
@@ -2919,19 +2944,19 @@ function updateScanBtn(){
   btn.style.background=hasPos?'':'var(--green)';
   btn.style.color=hasPos?'':'#fff';
 }
-async function syncBalance(){
+async function fullSync(){
   try{
     const r=await fetch('/api/alpaca_balance');const d=await r.json();
-    if(d.error){alert('获取Alpaca资金失败: '+d.error);return;}
-    const msg=`同步后将重置本地账户：
-本地资金基准 → Alpaca 总净值 $${Number(d.alpaca_equity).toLocaleString()}
-本地持仓将清空（以 Alpaca 实际持仓为准）
+    if(d.error){alert('获取Alpaca数据失败: '+d.error);return;}
+    const msg=`全量同步将以 Alpaca 数据为准重置本地账户：
+资金基准 → Alpaca 总净值 $${Number(d.alpaca_equity).toLocaleString()}
+持仓 → 同步 Alpaca 当前持仓
 
 确认同步？`;
     if(!confirm(msg))return;
-    await fetch('/api/sync_balance',{method:'POST'});
+    await fetch('/api/full_sync',{method:'POST'});
     await load();loadAlpacaStatus();
-    alert('资金已同步');
+    alert('全量同步完成');
   }catch(e){alert('同步失败: '+e.message);}
 }
 
