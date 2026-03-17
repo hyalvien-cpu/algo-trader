@@ -2110,14 +2110,9 @@ def api_full_sync():
     # 清空所有持仓，由 alpaca_sync_positions 重建
     data["positions"] = {}
     save(data)
-    # 同步 Alpaca 持仓
+    # 同步 Alpaca 持仓（创建 source="alpaca" 的展示记录）
     alpaca_sync_positions()
-    # 重新计算 cash = equity - 同步进来的持仓市值
-    data = load()
-    local_mkt = sum(p["shares"] * data.get("prices",{}).get(t, p["avg_cost"])
-                    for t, p in data["positions"].items())
-    data["cash"] = eq - local_mkt
-    save(data)
+    # cash 保持 = equity，因为 alpaca 持仓不参与本地 portfolio_value 计算
     return jsonify({"ok":True,"equity":round(eq,2)})
 
 @app.route("/api/alpaca_auto_capital",methods=["POST"])
