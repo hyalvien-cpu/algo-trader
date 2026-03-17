@@ -1639,22 +1639,9 @@ def run_cycle_bg():
         scan_status["log"].append({"msg":msg,"type":t,"time":now_pdt().strftime("%H:%M:%S")})
         print(f"[{now_pdt():%H:%M:%S} PDT] {msg}")
 
-    # Alpaca 资金 & 持仓同步
+    # Alpaca 持仓同步（不覆盖本地资金）
     if alpaca_enabled:
-        log("🔄 同步 Alpaca 资金与持仓...","info")
-        try:
-            acct = alpaca_get_account()
-            eq = float(acct.get("equity", 0))
-            ac = float(acct.get("cash", 0))
-            if eq >= 1000:
-                _d = load()
-                CONFIG["INITIAL_CASH"] = eq
-                _d["initial_cash"] = eq
-                _d["cash"] = ac
-                save(_d)
-                log(f"💰 已同步 Alpaca 资金: 总资产 ${eq:,.2f} 现金 ${ac:,.2f}","success")
-        except Exception as e:
-            log(f"Alpaca 资金同步失败: {e}","warning")
+        log("🔄 同步 Alpaca 持仓...","info")
         alpaca_sync_positions()
 
     data=load()
@@ -3109,26 +3096,11 @@ def start_scheduler():
         print("[提示] pip install apscheduler 开启定时自动交易")
 
 def _auto_init_capital():
-    """启动时自动从 Alpaca 读取资金量设置"""
-    if not alpaca_enabled:
-        return
+    """启动时从持久化数据恢复资金设置（不覆盖本地资金）"""
     data = load()
-    # 已手动设置过资金则跳过
-    if data.get("_alpaca_capital_synced"):
-        return
-    try:
-        acct = alpaca_get_account()
-        equity = float(acct.get("equity", 0))
-        if equity >= 1000:
-            CONFIG["INITIAL_CASH"] = equity
-            data["initial_cash"] = equity
-            data["base_nav"] = equity
-            data["cash"] = equity
-            data["_alpaca_capital_synced"] = True
-            save(data)
-            print(f"[启动] 自动从 Alpaca 同步资金量: ${equity:,.2f}")
-    except Exception as e:
-        print(f"[启动] Alpaca 资金同步失败: {e}")
+    if "initial_cash" in data:
+        CONFIG["INITIAL_CASH"] = data["initial_cash"]
+        print(f"[启动] 恢复资金设置: ${CONFIG['INITIAL_CASH']:,.2f}")
 
 def _auto_first_scan():
     """若无交易记录，自动触发首次扫描"""
