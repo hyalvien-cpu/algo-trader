@@ -2083,7 +2083,6 @@ def api_sync_balance():
     data = load()
     CONFIG["INITIAL_CASH"] = eq
     data["initial_cash"] = eq
-    data["base_nav"] = eq
     data["cash"] = ac
     save(data)
     return jsonify({"ok":True,"equity":round(eq,2),"cash":round(ac,2)})
@@ -2102,7 +2101,6 @@ def api_alpaca_auto_capital():
     data = load()
     CONFIG["INITIAL_CASH"] = equity
     data["initial_cash"] = equity
-    data["base_nav"] = equity
     local_mkt = sum(p["shares"]*data.get("prices",{}).get(t,p["avg_cost"])
                      for t,p in data["positions"].items() if p.get("source","local")=="local")
     data["cash"] = equity - local_mkt
@@ -2922,15 +2920,13 @@ async function syncBalance(){
   try{
     const r=await fetch('/api/alpaca_balance');const d=await r.json();
     if(d.error){alert('获取Alpaca资金失败: '+d.error);return;}
-    const msg=`Alpaca账户:
-  权益: $${Number(d.alpaca_equity).toLocaleString()}
-  现金: $${Number(d.alpaca_cash).toLocaleString()}
+    const msg=`同步后将把本地可用现金更新为 Alpaca 现金 $${Number(d.alpaca_cash).toLocaleString()}
+基准线不变，盈亏计算不受影响
 
-本地系统:
-  基准资金: $${Number(d.local_initial).toLocaleString()}
-  现金: $${Number(d.local_cash).toLocaleString()}
+Alpaca 权益: $${Number(d.alpaca_equity).toLocaleString()}
+本地现金: $${Number(d.local_cash).toLocaleString()}
 
-是否将Alpaca资金同步到本地系统？`;
+确认同步？`;
     if(!confirm(msg))return;
     await fetch('/api/sync_balance',{method:'POST'});
     await load();loadAlpacaStatus();
