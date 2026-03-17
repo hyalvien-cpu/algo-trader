@@ -2083,9 +2083,12 @@ def api_sync_balance():
     data = load()
     CONFIG["INITIAL_CASH"] = eq
     data["initial_cash"] = eq
-    data["cash"] = ac
+    data["base_nav"] = eq
+    data["cash"] = eq  # 本地无持仓，可用现金=总净值
+    # 清空本地持仓（以 Alpaca 实际持仓为准）
+    data["positions"] = {k:v for k,v in data["positions"].items() if v.get("source")=="alpaca"}
     save(data)
-    return jsonify({"ok":True,"equity":round(eq,2),"cash":round(ac,2)})
+    return jsonify({"ok":True,"equity":round(eq,2)})
 
 @app.route("/api/alpaca_auto_capital",methods=["POST"])
 def api_alpaca_auto_capital():
@@ -2920,11 +2923,9 @@ async function syncBalance(){
   try{
     const r=await fetch('/api/alpaca_balance');const d=await r.json();
     if(d.error){alert('获取Alpaca资金失败: '+d.error);return;}
-    const msg=`同步后将把本地可用现金更新为 Alpaca 现金 $${Number(d.alpaca_cash).toLocaleString()}
-基准线不变，盈亏计算不受影响
-
-Alpaca 权益: $${Number(d.alpaca_equity).toLocaleString()}
-本地现金: $${Number(d.local_cash).toLocaleString()}
+    const msg=`同步后将重置本地账户：
+本地资金基准 → Alpaca 总净值 $${Number(d.alpaca_equity).toLocaleString()}
+本地持仓将清空（以 Alpaca 实际持仓为准）
 
 确认同步？`;
     if(!confirm(msg))return;
