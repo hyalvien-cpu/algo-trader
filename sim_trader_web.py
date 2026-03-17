@@ -13,7 +13,20 @@ sim_trader_web.py — 新闻驱动板块轮动 + K线分析 模拟交易系统
 """
 
 import json, time, warnings, threading, os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# PDT = UTC-7（西雅图夏令时 3月-11月）
+_PDT = timezone(timedelta(hours=-7))
+
+def now_pdt():
+    """返回当前西雅图 PDT 时间"""
+    return datetime.now(timezone.utc).astimezone(_PDT)
+
+def fmt_pdt(dt=None):
+    """格式化为 PDT 时间字符串"""
+    if dt is None:
+        dt = now_pdt()
+    return dt.strftime("%Y-%m-%d %H:%M:%S PDT")
 from pathlib import Path
 from functools import wraps
 from flask import Flask, jsonify, request, render_template_string, make_response, redirect
@@ -283,7 +296,7 @@ def load():
          "daily_nav": [], "prices": {}, "sector_scores": {},
          "base_nav": CONFIG["INITIAL_CASH"],
          "initial_cash": CONFIG["INITIAL_CASH"],
-         "created": datetime.now().strftime("%Y-%m-%d")}
+         "created": now_pdt().strftime("%Y-%m-%d")}
     save(d); return d
 
 def save(d):
@@ -658,8 +671,8 @@ def analyze_sector_sentiment(news_items):
 
 def generate_daily_summary(news_items: list, sector_scores: dict, top_sectors: list,
                             actions: list) -> dict:
-    today = datetime.now().strftime("%Y年%m月%d日")
-    now   = datetime.now().strftime("%H:%M")
+    today = now_pdt().strftime("%Y年%m月%d日")
+    now   = now_pdt().strftime("%H:%M")
 
     # 按板块分组
     by_sector = {}
@@ -1200,7 +1213,7 @@ def run_backtest(tickers, period_days=180, initial_cash=100000):
     import numpy as np
 
     # 拉取历史数据
-    end = datetime.now()
+    end = now_pdt()
     start = end - timedelta(days=period_days + 30)  # 多拉30天给指标预热
     data_frames = {}
     for t in tickers:
@@ -1452,13 +1465,13 @@ def sim_buy(data, ticker, price, usd, analysis):
     if ticker in data["positions"]:
         p=data["positions"][ticker]; ns=p["shares"]+shares
         p["avg_cost"]=(p["shares"]*p["avg_cost"]+shares*price)/ns; p["shares"]=ns
-        p["target_sell_date"]=(datetime.now()+timedelta(days=analysis.get("suggested_hold_days",14))).strftime("%Y-%m-%d")
+        p["target_sell_date"]=(now_pdt()+timedelta(days=analysis.get("suggested_hold_days",14))).strftime("%Y-%m-%d")
     else:
         conf = analysis.get("confidence", {})
         data["positions"][ticker]={
             "shares":shares,"avg_cost":price,
-            "buy_date":datetime.now().strftime("%Y-%m-%d"),
-            "target_sell_date":(datetime.now()+timedelta(days=analysis.get("suggested_hold_days",14))).strftime("%Y-%m-%d"),
+            "buy_date":now_pdt().strftime("%Y-%m-%d"),
+            "target_sell_date":(now_pdt()+timedelta(days=analysis.get("suggested_hold_days",14))).strftime("%Y-%m-%d"),
             "hold_reason":analysis.get("hold_reason",""),
             "buy_score":analysis.get("score",0),
             "sector":analysis.get("sector",""),
@@ -1469,7 +1482,7 @@ def sim_buy(data, ticker, price, usd, analysis):
             "source": "local",
         }
     data["cash"]-=(usd+comm)
-    data["trades"].append({"time":datetime.now().strftime("%Y-%m-%d %H:%M"),
+    data["trades"].append({"time":now_pdt().strftime("%Y-%m-%d %H:%M"),
         "action":"BUY","ticker":ticker,"shares":round(shares,4),"price":price,
         "amount":round(usd,2),"commission":round(comm,2),"pnl":0,"pnl_pct":0,
         "score":analysis.get("score",0),
@@ -1504,10 +1517,10 @@ def sim_sell(data, ticker, price, reason="SELL"):
     net=p["shares"]*price*(1-CONFIG["COMMISSION"])
     pnl=net-p["shares"]*p["avg_cost"]
     pnl_pct=pnl/(p["shares"]*p["avg_cost"])*100
-    hold_days=(datetime.now()-datetime.strptime(p.get("buy_date",datetime.now().strftime("%Y-%m-%d")),"%Y-%m-%d")).days
+    hold_days=(now_pdt()-datetime.strptime(p.get("buy_date",now_pdt().strftime("%Y-%m-%d")),"%Y-%m-%d").replace(tzinfo=_PDT)).days
     if p.get("source","local")=="local":
         data["cash"]+=net
-    data["trades"].append({"time":datetime.now().strftime("%Y-%m-%d %H:%M"),
+    data["trades"].append({"time":now_pdt().strftime("%Y-%m-%d %H:%M"),
         "action":reason,"ticker":ticker,"shares":round(p["shares"],4),
         "price":price,"amount":round(net,2),"pnl":round(pnl,2),
         "pnl_pct":round(pnl_pct,2),"hold_days":hold_days,"sector":p.get("sector","")})
@@ -1568,8 +1581,8 @@ def alpaca_sync_positions():
                     continue
                 data["positions"][akey] = {
                     "shares": shares, "avg_cost": avg_cost,
-                    "buy_date": datetime.now().strftime("%Y-%m-%d"),
-                    "target_sell_date": (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"),
+                    "buy_date": now_pdt().strftime("%Y-%m-%d"),
+                    "target_sell_date": (now_pdt() + timedelta(days=14)).strftime("%Y-%m-%d"),
                     "hold_reason": "Alpaca同步", "buy_score": 0, "sector": "",
                     "peak_price": price, "trailing_drawdown": 0.0,
                     "confidence_score": 0, "confidence_level": "",
@@ -1591,7 +1604,7 @@ def alpaca_sync_positions():
 
 def run_premarket_analysis():
     """盘前准备：只爬新闻分析宏观，不下单"""
-    print(f"[盘前准备 {datetime.now():%H:%M:%S}] 开始盘前新闻分析...")
+    print(f"[盘前准备 {now_pdt():%H:%M:%S} PDT] 开始盘前新闻分析...")
     try:
         news = fetch_all_news()
         macro_news = fetch_macro_news()
@@ -1604,7 +1617,7 @@ def run_premarket_analysis():
         top_sectors = [n for n, _ in sorted_s[:CONFIG["TOP_SECTORS"]]]
         bias_text = "利空" if macro_adj["market_bias"] < 0 else "利好" if macro_adj["market_bias"] > 0 else "中性"
         data["pre_market_analysis"] = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "time": now_pdt().strftime("%Y-%m-%d %H:%M PDT"),
             "news_count": len(news),
             "macro_news_count": len(macro_news),
             "macro_bias": macro_adj["market_bias"],
@@ -1623,8 +1636,8 @@ def run_cycle_bg():
                  "phase":"爬取新闻","sector_scores":{},"analyses":[]}
 
     def log(msg,t="info"):
-        scan_status["log"].append({"msg":msg,"type":t,"time":datetime.now().strftime("%H:%M:%S")})
-        print(f"[{datetime.now():%H:%M:%S}] {msg}")
+        scan_status["log"].append({"msg":msg,"type":t,"time":now_pdt().strftime("%H:%M:%S")})
+        print(f"[{now_pdt():%H:%M:%S} PDT] {msg}")
 
     # Alpaca 资金 & 持仓同步
     if alpaca_enabled:
@@ -1757,7 +1770,7 @@ def run_cycle_bg():
             log(f"📅 {ticker} 今日财报，跳过评估","warning")
             continue
         td=p.get("target_sell_date","")
-        if td and datetime.now().strftime("%Y-%m-%d")>=td:
+        if td and now_pdt().strftime("%Y-%m-%d")>=td:
             log(f"📅 {ticker} 到期重新评估...","info")
             a=full_analysis(ticker, macro_adj=macro_adj, sector=pos_sector)
             if a:
@@ -1765,7 +1778,7 @@ def run_cycle_bg():
                     ok,msg=sim_sell(data,ticker,price,"PERIOD_SELL"); log(f"📤 期满离场: {msg}","warning")
                 else:
                     extra=a["suggested_hold_days"]
-                    data["positions"][ticker]["target_sell_date"]=(datetime.now()+timedelta(days=extra)).strftime("%Y-%m-%d")
+                    data["positions"][ticker]["target_sell_date"]=(now_pdt()+timedelta(days=extra)).strftime("%Y-%m-%d")
                     data["positions"][ticker]["hold_reason"]=a.get("hold_reason","")
                     log(f"🔄 {ticker} 评分{a['score']}，延期{extra}天","success")
             time.sleep(0.3)
@@ -1849,7 +1862,7 @@ def run_cycle_bg():
     new_prices=get_prices([t for t,p in data["positions"].items() if p.get("source","local")=="local"])
     data["prices"].update(new_prices)
     nav_val=portfolio_value(data,data["prices"])
-    today=datetime.now().strftime("%Y-%m-%d")
+    today=now_pdt().strftime("%Y-%m-%d")
     nav=data.get("daily_nav",[])
     if not nav or nav[-1]["date"]!=today:
         nav.append({"date":today,"nav":round(nav_val,2),"top_sector":top_sectors[0] if top_sectors else ""})
@@ -1898,10 +1911,10 @@ def api_portfolio():
         source=p.get("source","local")
         display_ticker=ticker.replace("_alpaca_","") if ticker.startswith("_alpaca_") else ticker
         price=prices.get(ticker,p["avg_cost"]); mkt=p["shares"]*price; cost=p["shares"]*p["avg_cost"]
-        hold_days=(datetime.now()-datetime.strptime(p.get("buy_date",datetime.now().strftime("%Y-%m-%d")),"%Y-%m-%d")).days
+        hold_days=(now_pdt()-datetime.strptime(p.get("buy_date",now_pdt().strftime("%Y-%m-%d")),"%Y-%m-%d").replace(tzinfo=_PDT)).days
         days_left=0
         if p.get("target_sell_date"):
-            try: days_left=max(0,(datetime.strptime(p["target_sell_date"],"%Y-%m-%d")-datetime.now()).days)
+            try: days_left=max(0,(datetime.strptime(p["target_sell_date"],"%Y-%m-%d").replace(tzinfo=_PDT)-now_pdt()).days)
             except: pass
         ref_total = total if source=="local" else mkt  # alpaca 持仓 weight 用自身
         row={"ticker":display_ticker,"shares":round(p["shares"],4),"avg_cost":p["avg_cost"],
@@ -2012,7 +2025,6 @@ def api_auto_trade_toggle():
 
 @app.route("/api/market_schedule")
 def api_market_schedule():
-    from datetime import timezone
     try:
         import zoneinfo
         et=datetime.now(zoneinfo.ZoneInfo("America/New_York"))
@@ -2631,7 +2643,7 @@ async function pollScan(){
     clearInterval(scanPoll);
     const btn=document.getElementById('scan-btn');
     btn.disabled=false;btn.classList.remove('running');updateScanBtn();
-    document.getElementById('last-scan').textContent='最后: '+new Date().toLocaleTimeString('zh');
+    document.getElementById('last-scan').textContent='最后: '+new Date().toLocaleTimeString('zh')+' PDT';
     document.getElementById('phase').textContent='';
     setTimeout(load,600);
   }
@@ -2994,7 +3006,7 @@ def _news_crawler_loop():
     while True:
         try:
             _live_news["running"] = True
-            now_str = datetime.now().strftime("%H:%M:%S")
+            now_str = now_pdt().strftime("%H:%M:%S")
             print(f"\n[新闻爬虫 {now_str}] ── 第{_live_news['fetch_count']+1}轮爬取开始 ──")
 
             # 爬取板块新闻
@@ -3035,7 +3047,7 @@ def _news_crawler_loop():
             # 保留最新200条
             _live_news["items"] = valuable[:200]
             _live_news["macro_items"] = [i for i in valuable if i.get("category") == "宏观政策"][:50]
-            _live_news["last_fetch"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _live_news["last_fetch"] = now_pdt().strftime("%Y-%m-%d %H:%M:%S PDT")
             _live_news["fetch_count"] += 1
 
             # 板块情绪快照
