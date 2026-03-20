@@ -12,7 +12,7 @@ sim_trader_web.py — 新闻驱动板块轮动 + K线分析 模拟交易系统
 启动: python sim_trader_web.py
 """
 
-import json, time, warnings, threading, os
+import json, time, warnings, threading, os, math
 from datetime import datetime, timedelta, timezone
 
 # PDT = UTC-7（西雅图夏令时 3月-11月）
@@ -1450,9 +1450,11 @@ def local_pos_count(data):
 
 def portfolio_value(data, prices):
     """只计算 source=local 的持仓市值 + 现金"""
-    return data["cash"] + sum(
-        v["shares"]*prices.get(k,v["avg_cost"]) for k,v in data["positions"].items()
-        if v.get("source","local")=="local")
+    cash = float(data.get("cash", 0) or 0)
+    mkt = sum(v["shares"]*prices.get(k,v["avg_cost"]) for k,v in data["positions"].items()
+              if v.get("source","local")=="local")
+    val = cash + mkt
+    return val if not math.isnan(val) else cash
 
 def sim_buy(data, ticker, price, usd, analysis):
     # 板块集中度双重检查
@@ -1851,9 +1853,12 @@ def run_cycle_bg():
     nav_val=portfolio_value(data,data["prices"])
     today=now_pdt().strftime("%Y-%m-%d")
     nav=data.get("daily_nav",[])
-    if not nav or nav[-1]["date"]!=today:
-        nav.append({"date":today,"nav":round(nav_val,2),"top_sector":top_sectors[0] if top_sectors else ""})
-        data["daily_nav"]=nav[-365:]
+    # 过滤掉历史中的 NaN 记录
+    nav=[n for n in nav if isinstance(n.get("nav"), (int,float)) and not math.isnan(n["nav"])]
+    if isinstance(nav_val,(int,float)) and not math.isnan(nav_val):
+        if not nav or nav[-1]["date"]!=today:
+            nav.append({"date":today,"nav":round(nav_val,2),"top_sector":top_sectors[0] if top_sectors else ""})
+    data["daily_nav"]=nav[-365:]
 
     # Phase 6: 生成每日总结
     scan_status["phase"]="生成总结"
@@ -1926,7 +1931,7 @@ def api_portfolio():
     return jsonify({"cash":round(data["cash"],2),"total":round(total,2),
         "pnl":round(total-base,2),"pnl_pct":round((total-base)/base*100,2) if base else 0,
         "positions":positions,"alpaca_positions":alpaca_positions,
-        "nav":data.get("daily_nav",[])[-90:],
+        "nav":[n for n in data.get("daily_nav",[])[-90:] if isinstance(n.get("nav"),(int,float)) and n["nav"]==n["nav"]],
         "trades":data.get("trades",[])[-40:],"sector_scores":data.get("sector_scores",{}),
         "macro_adj":data.get("macro_adj",{}),
         "config":{"initial":init,"base_nav":round(base,2),"max_pos":CONFIG["MAX_POSITIONS"]}})
