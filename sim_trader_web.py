@@ -2053,87 +2053,6 @@ def api_reset_baseline():
     save(data)
     return jsonify({"ok":True,"base_nav":round(total,2)})
 
-@app.route("/api/alpaca_balance")
-def api_alpaca_balance():
-    if not alpaca_enabled:
-        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
-    acct = alpaca_get_account()
-    if "error" in (acct or {}):
-        return jsonify({"ok":False,"msg":acct.get("error","")})
-    eq = float(acct.get("equity", 0))
-    ac = float(acct.get("cash", 0))
-    data = load()
-    local_init = CONFIG["INITIAL_CASH"]
-    local_cash = data["cash"]
-    in_sync = abs(eq - local_init) / max(local_init, 1) < 0.01
-    return jsonify({"ok":True,"alpaca_equity":round(eq,2),"alpaca_cash":round(ac,2),
-        "local_initial":round(local_init,2),"local_cash":round(local_cash,2),"in_sync":in_sync})
-
-@app.route("/api/sync_balance",methods=["POST"])
-def api_sync_balance():
-    if not alpaca_enabled:
-        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
-    acct = alpaca_get_account()
-    if "error" in (acct or {}):
-        return jsonify({"ok":False,"msg":acct.get("error","")})
-    eq = float(acct.get("equity", 0))
-    ac = float(acct.get("cash", 0))
-    if eq < 1000:
-        return jsonify({"ok":False,"msg":f"Alpaca 余额过低 ${eq:,.2f}"})
-    data = load()
-    CONFIG["INITIAL_CASH"] = eq
-    data["initial_cash"] = eq
-    data["base_nav"] = eq
-    data["cash"] = eq  # 本地无持仓，可用现金=总净值
-    # 清空本地持仓（以 Alpaca 实际持仓为准）
-    data["positions"] = {k:v for k,v in data["positions"].items() if v.get("source")=="alpaca"}
-    save(data)
-    return jsonify({"ok":True,"equity":round(eq,2)})
-
-@app.route("/api/full_sync",methods=["POST"])
-def api_full_sync():
-    """全量同步：以 Alpaca 数据为准重置本地账户"""
-    if not alpaca_enabled:
-        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
-    acct = alpaca_get_account()
-    if "error" in (acct or {}):
-        return jsonify({"ok":False,"msg":acct.get("error","")})
-    eq = float(acct.get("equity", 0))
-    if eq < 1000:
-        return jsonify({"ok":False,"msg":f"Alpaca 余额过低 ${eq:,.2f}"})
-    # 重置资金基准
-    data = load()
-    CONFIG["INITIAL_CASH"] = eq
-    data["initial_cash"] = eq
-    data["base_nav"] = eq
-    data["cash"] = eq
-    # 清空所有持仓，由 alpaca_sync_positions 重建
-    data["positions"] = {}
-    save(data)
-    # 同步 Alpaca 持仓（创建 source="alpaca" 的展示记录）
-    alpaca_sync_positions()
-    # cash 保持 = equity，因为 alpaca 持仓不参与本地 portfolio_value 计算
-    return jsonify({"ok":True,"equity":round(eq,2)})
-
-@app.route("/api/alpaca_auto_capital",methods=["POST"])
-def api_alpaca_auto_capital():
-    """从 Alpaca 账户读取 equity 自动设置为本地资金量"""
-    if not alpaca_enabled:
-        return jsonify({"ok":False,"msg":"Alpaca 未启用"})
-    acct = alpaca_get_account()
-    if "error" in (acct or {}):
-        return jsonify({"ok":False,"msg":acct.get("error","获取账户失败")})
-    equity = float(acct.get("equity", 0))
-    if equity < 1000:
-        return jsonify({"ok":False,"msg":f"Alpaca 账户余额过低 ${equity:,.2f}"})
-    data = load()
-    CONFIG["INITIAL_CASH"] = equity
-    data["initial_cash"] = equity
-    local_mkt = sum(p["shares"]*data.get("prices",{}).get(t,p["avg_cost"])
-                     for t,p in data["positions"].items() if p.get("source","local")=="local")
-    data["cash"] = equity - local_mkt
-    save(data)
-    return jsonify({"ok":True,"equity":round(equity,2),"cash":round(data["cash"],2)})
 
 @app.route("/api/set_capital",methods=["POST"])
 def api_set_capital():
@@ -2296,7 +2215,6 @@ tr:hover td{background:rgba(124,110,255,0.03)}
     <span id="alpaca-cash" style="font-size:12px;color:var(--muted)">现金 —</span>
     <span id="alpaca-market" style="font-size:11px;padding:2px 8px;border-radius:4px;background:var(--card);color:var(--muted)">市场 —</span>
     <span id="auto-trade-badge" style="font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer" onclick="toggleAutoTrade()">—</span>
-    <button onclick="fullSync()" style="margin-left:auto;padding:5px 14px;font-size:11px;background:transparent;border:0.5px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer">全量同步</button>
   </div>
   <div id="schedule-card" style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:18px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
     <div style="display:flex;align-items:center;gap:6px">
@@ -2939,54 +2857,7 @@ function updateScanBtn(){
   btn.style.background=hasPos?'':'var(--green)';
   btn.style.color=hasPos?'':'#fff';
 }
-async function fullSync(){
-  try{
-    const r=await fetch('/api/alpaca_balance');const d=await r.json();
-    if(d.error){alert('获取Alpaca数据失败: '+d.error);return;}
-    const msg=`全量同步将以 Alpaca 数据为准重置本地账户：
-资金基准 → Alpaca 总净值 $${Number(d.alpaca_equity).toLocaleString()}
-持仓 → 同步 Alpaca 当前持仓
-
-确认同步？`;
-    if(!confirm(msg))return;
-    await fetch('/api/full_sync',{method:'POST'});
-    await load();loadAlpacaStatus();
-    alert('全量同步完成');
-  }catch(e){alert('同步失败: '+e.message);}
-}
-
-async function checkAlpacaCapital(){
-  try{
-    const r=await fetch('/api/alpaca_status');const d=await r.json();
-    if(!d.enabled)return;
-    const eq=parseFloat(d.account?.equity||0);
-    if(eq<1000)return;
-    const cur=portfolio.config?.initial||100000;
-    // 资金差异超过5%才提示
-    if(Math.abs(eq-cur)/cur<0.05)return;
-    const yes=confirm(
-      `Alpaca 模拟盘资金: $${eq.toLocaleString('en-US',{minimumFractionDigits:2})}
-当前本地资金: $${cur.toLocaleString('en-US',{minimumFractionDigits:2})}
-
-是否同步 Alpaca 资金量？
-
-点击「确定」自动同步
-点击「取消」手动设置`);
-    if(yes){
-      await fetch('/api/alpaca_auto_capital',{method:'POST'});
-      await load();
-    }else{
-      // 跳转资金设置页
-      document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
-      document.getElementById('page-settings').classList.add('active');
-      document.querySelectorAll('.nav-item').forEach(x=>{if(x.textContent.includes('资金设置'))x.classList.add('active');});
-    }
-  }catch(e){}
-}
-
 load();loadSummaries();pollModelStatus();loadLiveNews();loadAlpacaStatus();loadSchedule();
-setTimeout(checkAlpacaCapital,2000);
 setInterval(load,30000);setInterval(loadSummaries,60000);setInterval(loadLiveNews,30000);setInterval(loadAlpacaStatus,60000);setInterval(loadSchedule,60000);
 </script></body></html>"""
 
