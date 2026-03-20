@@ -1448,10 +1448,19 @@ def local_positions(data):
 def local_pos_count(data):
     return sum(1 for v in data["positions"].values() if v.get("source","local")=="local")
 
+def _safe_price(prices, ticker, fallback):
+    """获取价格，跳过 NaN"""
+    p = prices.get(ticker, fallback)
+    try:
+        p = float(p)
+        return p if not math.isnan(p) else float(fallback)
+    except (TypeError, ValueError):
+        return float(fallback)
+
 def portfolio_value(data, prices):
     """只计算 source=local 的持仓市值 + 现金"""
     cash = float(data.get("cash", 0) or 0)
-    mkt = sum(v["shares"]*prices.get(k,v["avg_cost"]) for k,v in data["positions"].items()
+    mkt = sum(v["shares"]*_safe_price(prices,k,v["avg_cost"]) for k,v in data["positions"].items()
               if v.get("source","local")=="local")
     val = cash + mkt
     return val if not math.isnan(val) else cash
@@ -1850,6 +1859,8 @@ def run_cycle_bg():
     # Phase 5: 净值快照
     new_prices=get_prices([t for t,p in data["positions"].items() if p.get("source","local")=="local"])
     data["prices"].update(new_prices)
+    # 清理价格中的 NaN
+    data["prices"]={k:v for k,v in data["prices"].items() if isinstance(v,(int,float)) and not math.isnan(v)}
     nav_val=portfolio_value(data,data["prices"])
     today=now_pdt().strftime("%Y-%m-%d")
     nav=data.get("daily_nav",[])
@@ -1902,7 +1913,7 @@ def api_portfolio():
     for ticker,p in data["positions"].items():
         source=p.get("source","local")
         display_ticker=ticker.replace("_alpaca_","") if ticker.startswith("_alpaca_") else ticker
-        price=prices.get(ticker,p["avg_cost"]); mkt=p["shares"]*price; cost=p["shares"]*p["avg_cost"]
+        price=_safe_price(prices,ticker,p["avg_cost"]); mkt=p["shares"]*price; cost=p["shares"]*p["avg_cost"]
         hold_days=(now_pdt()-datetime.strptime(p.get("buy_date",now_pdt().strftime("%Y-%m-%d")),"%Y-%m-%d").replace(tzinfo=_PDT)).days
         days_left=0
         if p.get("target_sell_date"):
